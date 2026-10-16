@@ -46,7 +46,8 @@ if defined MISSING (
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSDIR="
-if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath`) do set "VSDIR=%%i"
+if not defined VSDIR if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
 if not defined VSDIR (
 	echo Visual Studio 2022 or Build Tools 2022 with the "Desktop development with C++" workload not found.
 	exit /b 1
@@ -66,7 +67,7 @@ where ninja >nul 2>nul || (
 rem clang-cl: LLVM from winget (C:\Program Files\LLVM), else the VS "C++ Clang tools" component.
 set "LLVM_BIN="
 if exist "%VSDIR%\VC\Tools\Llvm\x64\bin\clang-cl.exe" set "LLVM_BIN=%VSDIR%\VC\Tools\Llvm\x64\bin"
-if exist "%ProgramFiles%\LLVM\bin\clang-cl.exe" set "LLVM_BIN=%ProgramFiles%\LLVM\bin"
+if not defined LLVM_BIN if exist "%ProgramFiles%\LLVM\bin\clang-cl.exe" set "LLVM_BIN=%ProgramFiles%\LLVM\bin"
 if defined LLVM_BIN set "PATH=%LLVM_BIN%;%PATH%"
 where clang-cl >nul 2>nul || (
 	echo clang-cl not found: install LLVM ^(winget install LLVM.LLVM --version 19.1.7^).
