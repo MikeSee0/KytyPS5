@@ -3,6 +3,7 @@
 #include "live-counters.h"
 #include "live-trace.h"
 #include "time-census.h"
+#include "writeback-verify.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -240,6 +241,16 @@ static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
 
 #include "memoryAddressSpace.inc"
+
+void ReleaseFrameGenAddressHole() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_frame_gen_hole != nullptr) {
+		VirtualFree(std::exchange(g_frame_gen_hole, nullptr), 0, MEM_RELEASE);
+		std::printf("Memory: 64 GiB above the guest released for the Vulkan device (KYTY_FG_ADDRESS_HOLE=0: none)\n");
+		std::fflush(stdout);
+	}
+#endif
+}
 
 enum class VirtualRangeType {
 	Reserved,
@@ -1266,6 +1277,10 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
+	// No page of it read-watched: no GPU-written bytes of a buffer over it (their pages are, from the write on: a CPU
+	// read faults), as NativeXprReader's direct reads take it. (The command processor asks for every indirect register
+	// table, ~11K a frame at 1-1, in memory the CPU writes: each a search of the GPU-written ranges.)
+	if (!GetGpuResources().HasReadWatchers(vaddr, size)) return true;
 	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
 		// KYTY_SYNC_LOG: which shader's resource evaluation drains the GPU for its words.
 		static const bool log = std::getenv("KYTY_SYNC_LOG") != nullptr;
@@ -1364,6 +1379,15 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 	const auto index = g_write_back_count.fetch_add(1, std::memory_order_relaxed);
 	g_write_backs[index % WriteBackRecords] = {std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                          vaddr, size, source};
+	// (Diagnostic, KYTY_WRITEBACK_VERIFY: the GPU-owned pages checked before, hashed again after.)
+	struct Verify {
+		uint64_t vaddr, size;
+		bool     on;
+		~Verify() {
+			if (on) WritebackVerify::Rehash(vaddr, size);
+		}
+	} verify {vaddr, size, WritebackVerify::Enabled()};
+	if (verify.on) WritebackVerify::Check(vaddr, static_cast<const uint8_t*>(data), size, source);
 	if (TryWriteBacking(vaddr, data, size)) {
 		return;
 	}

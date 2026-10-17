@@ -158,6 +158,11 @@ public:
 	};
 	void SynchronizeRegionRequest(SyncRegionRequest& request);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
+	// Moves whenever a buffer is unregistered (deleted, or joined into a new one): Vulkan buffers a binding resolved
+	// before it is unchanged are still the owners of their bytes. A join copies the old buffer's bytes into the new
+	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
+	// nothing reads again (the old buffer lives until the tick). The render thread's.
+	[[nodiscard]] uint64_t UnregisterEpoch() const { return m_unregister_epoch; }
 	// A buffer registered or unregistered in the tracker regions of the range since `epoch`.
 	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
@@ -226,9 +231,16 @@ public:
 	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
 
 	void               RunGarbageCollector(bool collect = true);
+	// The video memory the game buffers in use that got system memory need back, with headroom (0: none): the texture
+	// collector makes this room too (TextureCache::RunGarbageCollector). Updated every 60 flips.
+	[[nodiscard]] uint64_t SpilledRoom() const noexcept { return m_spilled_room; }
 
 private:
 	friend struct BufferCacheTestAccess;
+
+	// A game buffer in use made in system memory (Buffer::IsInSystemMemory: video memory over budget then) goes back to
+	// video memory once there is room for it, one a call (RunGarbageCollector, every 60 flips). True when one moved.
+	bool MoveSpilledBufferBack();
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {
@@ -305,6 +317,7 @@ private:
 	BufferMap                                         m_buffers;
 	// (Read by a speculative translation's thread: src/graphics/guest_gpu/speculation.h.)
 	std::atomic<uint64_t> m_registration_epoch {1};
+	uint64_t              m_unregister_epoch {1};
 	// Per tracker region, see RegionRegistrationEpoch.
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
@@ -384,6 +397,12 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// When each recent collector tick began (steady clock, by tick % size): RetireStaleBuffers counts idleness in time.
+	std::array<int64_t, 8192> m_tick_times {};
+	bool                      m_retire_pressure = false; // the video memory in use at the critical level
+	// The registered game buffers in system memory and the room those in use need (MoveSpilledBufferBack).
+	std::vector<BufferId> m_spilled;
+	uint64_t              m_spilled_room = 0;
 
 	// KYTY_READBACK_QUEUE: GPU writes that may still be in flight, oldest first. An entry's
 	// tick is set at the next point between commands (every write noted by then is recorded

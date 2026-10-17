@@ -481,10 +481,12 @@ static ResolvedDynamicState ResolveGraphicsDynamicParams(const Buffer& buffer, b
 	}
 
 	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
+	// mask. Attachment availability therefore follows the target write mask, and CB_SHADER_MASK: a target the pixel
+	// shader exports nothing to is not written (render_target_write_mask_slot). Kept out of the pipelines' static
+	// color mask, so their keys and the precompiled caches do not depend on it.
 	out.color_count = color_count;
 	for (uint32_t i = 0; i < color_count; i++) {
-		out.color_write[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		out.color_write[i] = render_target_write_mask_slot(ctx, colors[i].target_slot) != 0
 		                         ? VK_TRUE
 		                         : VK_FALSE;
 	}
@@ -665,7 +667,8 @@ static DynamicState Capture(const CommandBuffer& buffer, const ShaderVertexInput
     const auto& ctx = buffer.GetRegisters();
     state.buffer.registers = {ctx.GetScreenViewport(), ctx.GetClipControl(),
         ctx.GetScanModeControl(), ctx.GetModeControl(), ctx.GetPolyOffset(),
-        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask()};
+        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask(),
+        ctx.GetShaderRegisters().m_cbShaderMask};
     const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
     state.buffer.graphics.properties.limits = {limits.maxFramebufferWidth, limits.maxFramebufferHeight,
         {limits.maxViewportDimensions[0], limits.maxViewportDimensions[1]}};
@@ -1510,18 +1513,23 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
-	if (!mesh_active) {
-		LogDrawPhase(draw.name, "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
-	}
 	std::pair<Buffer*, uint64_t> gpu_args {};
-	if (emit.gpu_args != 0) {
-		const uint64_t size = emit.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-		gpu_args = m_context.GetBufferCache().ObtainBuffer(
-		    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + size, false);
-		EXIT_IF(gpu_args.first == nullptr);
-	}
+	auto&    buffer_cache = m_context.GetBufferCache();
+	uint64_t unregistered = buffer_cache.UnregisterEpoch();
+	const auto acquire_buffers = [&] {
+		if (!mesh_active) {
+			LogDrawPhase(draw.name, "PrepareVertexBuffers");
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
+			index_binding   = PrepareIndexBuffer(buffer, index_source);
+		}
+		if (emit.gpu_args != 0) {
+			const uint64_t size = emit.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+			gpu_args = buffer_cache.ObtainBuffer(
+			    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + size, false);
+			EXIT_IF(gpu_args.first == nullptr);
+		}
+	};
+	acquire_buffers();
 	if (!emit.direct_run.empty() &&
 	    (m_context.GetGpuResources().MappingEpoch() != emit.run_mapping_epoch ||
 	     m_context.GetGpuResources().PreparationAliasEpoch() != emit.run_alias_epoch)) {
@@ -1530,6 +1538,22 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
+	// (The vertex, index and argument buffers and the targets' refreshes can join a buffer resolved before them into a new
+	// one, which then no longer owns its bytes: the bindings and these buffers resolved again until nothing was
+	// unregistered meanwhile, as PrepareGraphicsBindingsInto.)
+	for (uint32_t attempt = 0; attempt < 4 && buffer_cache.UnregisterEpoch() != unregistered; ++attempt) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Bindings: a buffer was unregistered while a draw's buffers and targets were made (VS 0x%016llx), "
+			            "resolved again\n",
+			            static_cast<unsigned long long>(bindings.vertex.runtime->program->shader_hash));
+		unregistered = buffer_cache.UnregisterEpoch();
+		RebindBuffers(bindings.vertex);
+		if (bindings.pixel) {
+			RebindBuffers(*bindings.pixel);
+		}
+		acquire_buffers();
+	}
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
@@ -1602,7 +1626,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LiveCounters::Add(LiveCounters::DirectDraws);
 		if (mesh_active) LiveCounters::Add(LiveCounters::MeshDraws);
 		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
-		                    state.depth_info, pipeline.pipeline, feedback_aspects);
+		                    state.depth_info, BindPipelineHandle(pipeline), feedback_aspects);
 	} else {
 		buffer.InvalidateGraphicsState();
 	}
@@ -1640,7 +1664,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
 		    m_context.GetGraphics().attachment_feedback_loop_enabled, feedback_aspects);
 		packet.command = vk_buffer;
-		packet.pipeline = pipeline.pipeline;
+		packet.pipeline = BindPipelineHandle(pipeline);
 		packet.index_buffer = index_binding.buffer;
 		packet.index_offset = index_binding.offset;
 		packet.index_type = index_binding.type;
