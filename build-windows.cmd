@@ -66,8 +66,8 @@ where ninja >nul 2>nul || (
 
 rem clang-cl: Prefer standalone LLVM, use VS bundled Clang as fallback.
 set "LLVM_BIN="
-if exist "%ProgramFiles%\LLVM\bin\clang-cl.exe" set "LLVM_BIN=%ProgramFiles%\LLVM\bin"
-if not defined LLVM_BIN if exist "%VSDIR%\VC\Tools\Llvm\x64\bin\clang-cl.exe" set "LLVM_BIN=%VSDIR%\VC\Tools\Llvm\x64\bin"
+if exist "%VSDIR%\VC\Tools\Llvm\x64\bin\clang-cl.exe" set "LLVM_BIN=%VSDIR%\VC\Tools\Llvm\x64\bin"
+if not defined LLVM_BIN if exist "%ProgramFiles%\LLVM\bin\clang-cl.exe" set "LLVM_BIN=%ProgramFiles%\LLVM\bin"
 if defined LLVM_BIN set "PATH=%LLVM_BIN%;%PATH%"
 where clang-cl >nul 2>nul || (
 	echo clang-cl not found: install LLVM ^(winget install LLVM.LLVM --version 19.1.7^).
