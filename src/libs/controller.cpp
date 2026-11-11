@@ -11,14 +11,18 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "local/anti-lag.h"
 #include "loader/demonsSoulsWarp.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace Libs::Controller {
@@ -30,6 +34,17 @@ constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389; /* 0x80920003 */
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
+constexpr uint64_t DROP_REPORT_MS     = 5000;
+
+// The newest unread input state takes an event that changes no button and no touch (GameController::AddState).
+// KYTY_PAD_STATE_COALESCE=0: every input event a state of its own, as before.
+static bool StateCoalescing() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PAD_STATE_COALESCE");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -102,14 +117,15 @@ public:
 
 	void Connect(int id);
 	void Disconnect(int id);
-	void Button(int id, uint32_t button, bool down);
+	void Button(int id, uint32_t button, bool down, uint32_t queued_ms = 0);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
 	void TouchPad(int id, int finger, bool down, float x, float y);
 	void ResetInputState();
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
-	void SetVibration(uint8_t large_motor, uint8_t small_motor);
+	// The active pad's name when it took the rumble, else nullptr (no pad, or the pad refused it).
+	const char* SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	int32_t GetTriggerEffectState(bool left);
@@ -121,6 +137,10 @@ private:
 
 	void CheckActive();
 	void AddState();
+	void CountDroppedState();
+	void ReportDroppedStates();
+	void NotePress(uint32_t queued_ms);
+	void NoteRead();
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -136,6 +156,18 @@ private:
 	// Every effect the game set, whether or not the host pad could reproduce it:
 	// scePadGetTriggerEffectState answers from it (m_trigger_sent keeps the sent one only).
 	PadTriggerEffectParam m_state_effect {};
+	// Input states dropped from the history before a read took them (AddState): in all, since the last report, and when
+	// that was (SDL ticks; none yet: m_dropped_reported).
+	uint64_t         m_dropped_states     = 0;
+	uint64_t         m_dropped_unreported = 0;
+	uint64_t         m_dropped_report_ms  = 0;
+	bool             m_dropped_reported   = false;
+	// Input timing (NotePress, NoteRead): the oldest press no read has taken yet (performance counter, 0: none) and its
+	// time in SDL's queue; per press since m_press_since (SDL ticks), its queue time and its time to the game's read.
+	uint64_t           m_press_pending        = 0;
+	uint32_t           m_press_pending_queued = 0;
+	uint64_t           m_press_since          = 0;
+	std::vector<float> m_press_queued_ms, m_press_read_ms;
 };
 
 static GameController* g_controller = nullptr;
@@ -351,8 +383,30 @@ void GameController::CheckActive() {
 	m_next_touch_id = 1;
 }
 
+// The history scePadRead returns, oldest unread first: a state per input event. Demon's Souls reads 64 each tick and
+// takes the presses and releases of every one, the last as the pad's state (its pad update, eboot 0xb933a0), so a press
+// is lost only when it leaves the STATES_MAX states unread. An event that changes no button and no touch (a stick or
+// trigger step, a finger moving) updates the newest state instead while no read has taken it (StateCoalescing): every
+// press and release keeps a state of its own, and a burst of axis events between two reads (a frame hitch: 5-43 of
+// 100 ms or more a session in the logs, one of 18.5 s) no longer pushes an unread press out.
 void GameController::AddState() {
+	if (m_states_num != 0 && StateCoalescing()) {
+		const auto  newest = (m_first_state + m_states_num - 1) % STATES_MAX;
+		const auto& last   = m_states[newest];
+		if (!m_obtained[newest] && last.buttons == m_state.buttons &&
+		    std::equal(std::begin(last.touch), std::end(last.touch), std::begin(m_state.touch),
+		               [](const ControllerState::Touch& a, const ControllerState::Touch& b) {
+			               return a.down == b.down && a.id == b.id;
+		               })) {
+			m_states[newest] = m_state;
+			return;
+		}
+	}
+
 	if (m_states_num >= STATES_MAX) {
+		if (!m_obtained[m_first_state]) {
+			CountDroppedState();
+		}
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;
 	}
@@ -363,13 +417,75 @@ void GameController::AddState() {
 	m_states_num++;
 }
 
-void GameController::Button(int id, uint32_t button, bool down) {
+// A state dropped before a read took it: in the log (stdout) at most every DROP_REPORT_MS, the count since the last line.
+void GameController::CountDroppedState() {
+	m_dropped_states++;
+	m_dropped_unreported++;
+	if (const auto now = SDL_GetTicks64(); !m_dropped_reported || now - m_dropped_report_ms >= DROP_REPORT_MS) {
+		m_dropped_reported  = true;
+		m_dropped_report_ms = now;
+		ReportDroppedStates();
+	}
+}
+
+void GameController::ReportDroppedStates() {
+	if (m_dropped_unreported == 0) {
+		return;
+	}
+	std::printf("Pad: %llu input states dropped unread (the %u-state history was full; %llu in all)\n",
+	            static_cast<unsigned long long>(m_dropped_unreported), STATES_MAX,
+	            static_cast<unsigned long long>(m_dropped_states));
+	std::fflush(stdout);
+	m_dropped_unreported = 0;
+}
+
+// Input timing (issue #236: an attack started a second after its press, on an Xbox Elite pad over the Xbox Wireless
+// adapter): a press's time in SDL's queue before this emulator took it, and from then to the game's next read, which
+// takes it (every unread state, Demon's Souls 64 a tick: ReadStates). The game draws and shows its answer after that;
+// frame generation and the display add theirs. A press while another waits for a read is not timed. The log gets a line
+// every 30 s with presses in it. Caller holds m_mutex.
+void GameController::NotePress(uint32_t queued_ms) {
+	if (m_press_pending != 0) return;
+	m_press_pending        = SDL_GetPerformanceCounter();
+	m_press_pending_queued = queued_ms;
+}
+
+void GameController::NoteRead() {
+	if (m_press_pending == 0) return;
+	static const double ms_per_tick = 1000.0 / static_cast<double>(SDL_GetPerformanceFrequency());
+	m_press_read_ms.push_back(static_cast<float>(static_cast<double>(SDL_GetPerformanceCounter() - m_press_pending) * ms_per_tick));
+	m_press_queued_ms.push_back(static_cast<float>(m_press_pending_queued));
+	m_press_pending = 0;
+	const uint64_t now = SDL_GetTicks64();
+	if (m_press_since == 0) m_press_since = now;
+	if (now - m_press_since < 30000) return;
+	const auto median = [](std::vector<float>& values) {
+		std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2), values.end());
+		return static_cast<double>(values[values.size() / 2]);
+	};
+	// (A press during a load waits for the game's first read after it: the 1-1 bench start, one of 1.5 s.)
+	const double queued_max = *std::max_element(m_press_queued_ms.begin(), m_press_queued_ms.end());
+	const double read_max   = *std::max_element(m_press_read_ms.begin(), m_press_read_ms.end());
+	const auto   slow       = std::count_if(m_press_read_ms.begin(), m_press_read_ms.end(),
+	                                        [&](float read) { return read >= 100.0f; });
+	std::printf("Input: %zu presses in %.0f s: %.1f ms in SDL's queue (median; at most %.1f), %.1f ms more to the game's "
+	            "read (median; at most %.1f; %lld of them 100 ms or more)\n",
+	            m_press_read_ms.size(), static_cast<double>(now - m_press_since) / 1000.0, median(m_press_queued_ms),
+	            queued_max, median(m_press_read_ms), read_max, static_cast<long long>(slow));
+	std::fflush(stdout);
+	m_press_queued_ms.clear();
+	m_press_read_ms.clear();
+	m_press_since = now;
+}
+
+void GameController::Button(int id, uint32_t button, bool down, uint32_t queued_ms) {
 	Common::LockGuard lock(m_mutex);
 
 	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
+		if (down && (m_state.buttons & button) == 0) NotePress(queued_ms);
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
 
 		AddState();
@@ -478,25 +594,29 @@ void GameController::ReleaseHostPads() {
 	}
 
 	m_connected_ids.clear();
+	ReportDroppedStates();
 }
 
-void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
+const char* GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
-		return;
+		return nullptr;
 	}
 
 	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad == nullptr) {
-		return;
+		return nullptr;
 	}
 
 	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
 	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
 	if (SDL_GameControllerRumble(pad, large, small, RUMBLE_DURATION_MS) != 0) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
+		return nullptr;
 	}
+	const char* name = SDL_GameControllerName(pad);
+	return name != nullptr ? name : "a pad";
 }
 
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
@@ -617,6 +737,7 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	*flag  = m_connected;
 	*count = m_connected_count;
 	*state = m_state;
+	NoteRead();
 }
 
 int GameController::ReadStates(ControllerState* states, int states_num, bool* flag, int* count) {
@@ -647,6 +768,7 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 			}
 		}
 	}
+	if (ret_num != 0) NoteRead();
 
 	return ret_num;
 }
@@ -659,8 +781,8 @@ void Disconnect(int id) {
 	g_controller->Disconnect(id);
 }
 
-void SetButton(int id, uint32_t button, bool down) {
-	g_controller->Button(id, button, down);
+void SetButton(int id, uint32_t button, bool down, uint32_t queued_ms) {
+	g_controller->Button(id, button, down, queued_ms);
 }
 
 void SetAxis(int id, Axis axis, int value) {
@@ -822,6 +944,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	bool            connected       = false;
 	ControllerState state;
 
+	Graphics::AntiLag::Input(); // (KYTY_LOW_LATENCY on AMD: a new frame's input; the driver may wait here)
 	g_controller->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
@@ -846,6 +969,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	bool            connected       = false;
 	ControllerState states[64]      = {};
 
+	Graphics::AntiLag::Input(); // (KYTY_LOW_LATENCY on AMD: a new frame's input; the driver may wait here)
 	int ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
 
 	if (!connected || ret_num == 0) {
@@ -860,6 +984,104 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	}
 
 	return ret_num;
+}
+
+// Demon's Souls sends its vibration only as haptic audio for the DualSense's actuators (the vibration port), never through
+// PadSetVibration, so an Xbox controller never vibrated (issue #236). Each channel's peak (left the large motor, right
+// the small one) is held with a decay, as the DualSense on Bluetooth's motors are (dualSenseHaptics.cpp
+// RumbleFromHaptics: x0.6 per 21.3 ms, so a single hit ends in ~250 ms and hits in consecutive blocks join), and the
+// motors are set once per 1024 frames (21.3 ms at 48 kHz). KYTY_PAD_RUMBLE_GAIN=<0..16> scales the drive (1 by
+// default: an Xbox pad's motors at the DualSense's reference 2 were too strong even at 1, issue #236; 0 leaves the
+// motors alone). KYTY_PAD_RUMBLE_ONSET=<0..1>: the level a block
+// needs to drive them (0.025, as the DualSense's: a quiet effect the game keeps playing, an enchanted weapon's hum at
+// 0.005-0.01, rumbled the whole buff long, issue #239; hits reach 0.25). KYTY_PAD_RUMBLE_SUSTAIN_MS=<0..5000>: a channel's
+// level less its average over that time (500 by default; 0: off): a hit drives the motors whole, an effect that goes on
+// fades in about as long (the title screen's, Continue's and each spawn's long effects, made for the DualSense's
+// actuators, rumbled an Xbox pad all along, issue #236: the bench start's two, 3.8 and 3.0 s over the onset, one of them
+// 1.8 s at 0.56, drive the motors ~2.0 and ~1.3 s, fading). KYTY_PAD_RUMBLE_TRACE=1: each step's levels in the log.
+void RumbleFromVibrationAudio(const void* data, uint32_t frames, uint32_t channels, bool is_float, const float* gains) {
+	static const float gain = [] {
+		const char* value = std::getenv("KYTY_PAD_RUMBLE_GAIN");
+#if defined(KYTY_STEAM_DECK)
+		constexpr float fallback = 2.0f; // (the Deck's own motors are weak)
+#else
+		constexpr float fallback = 1.0f;
+#endif
+		return value != nullptr && *value != 0 ? std::clamp(std::strtof(value, nullptr), 0.0f, 16.0f) : fallback;
+	}();
+	static const float onset = [] {
+		const char* value = std::getenv("KYTY_PAD_RUMBLE_ONSET");
+		return value != nullptr && *value != 0 ? std::clamp(std::strtof(value, nullptr), 0.0f, 1.0f) : 0.025f;
+	}();
+	constexpr float    DECAY = 0.6f, FLOOR = 0.01f;
+	constexpr uint32_t STEP  = 1024;
+	// (The average's weight a step: 1024 frames at 48 kHz, 21.3 ms.)
+	static const float sustain = [] {
+		const char* value = std::getenv("KYTY_PAD_RUMBLE_SUSTAIN_MS");
+		const float ms    = value != nullptr && *value != 0 ? std::clamp(std::strtof(value, nullptr), 0.0f, 5000.0f) : 500.0f;
+		return ms > 0.0f ? 1.0f - std::exp(-static_cast<float>(STEP) / 48.0f / ms) : 0.0f;
+	}();
+	static const bool trace = [] {
+		const char* value = std::getenv("KYTY_PAD_RUMBLE_TRACE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	if (gain == 0.0f || data == nullptr || frames == 0 || channels == 0 || g_controller == nullptr) {
+		return;
+	}
+	static std::mutex  mutex;
+	static float       peak[2] {}, held[2] {}, average[2] {};
+	static uint32_t    pending = 0;
+	std::lock_guard    lock(mutex);
+	for (uint32_t i = 0; i < frames; i++) {
+		for (uint32_t c = 0; c < channels; c++) {
+			const size_t at    = static_cast<size_t>(i) * channels + c;
+			float        value = is_float ? static_cast<const float*>(data)[at]
+			                              : static_cast<float>(static_cast<const int16_t*>(data)[at]) / 32768.0f;
+			if (gains != nullptr) value *= gains[c];
+			auto& motor = peak[std::min<uint32_t>(c, 1)];
+			motor       = std::max(motor, std::fabs(value));
+		}
+	}
+	if (channels == 1) peak[1] = peak[0];
+	pending += frames;
+	if (pending < STEP) {
+		return;
+	}
+	pending = 0;
+	const bool was_live = held[0] != 0.0f || held[1] != 0.0f;
+	float      level[2] {};
+	for (int m = 0; m < 2; m++) {
+		level[m] = peak[m];
+		if (sustain > 0.0f) {
+			average[m] += (peak[m] - average[m]) * sustain;
+			level[m] = std::max(0.0f, peak[m] - average[m]);
+		}
+		held[m] = std::max(level[m] >= onset ? level[m] : 0.0f, held[m] * DECAY);
+	}
+	if (trace && (peak[0] != 0.0f || peak[1] != 0.0f || was_live)) {
+		std::printf("Pad rumble trace: %llu ms, peaks %.3f %.3f, levels %.3f %.3f, held %.3f %.3f\n",
+		            static_cast<unsigned long long>(SDL_GetTicks64()), static_cast<double>(peak[0]),
+		            static_cast<double>(peak[1]), static_cast<double>(level[0]), static_cast<double>(level[1]),
+		            static_cast<double>(held[0]), static_cast<double>(held[1]));
+	}
+	peak[0] = peak[1] = 0.0f;
+	if (held[0] < FLOOR && held[1] < FLOOR) {
+		held[0] = held[1] = 0.0f;
+		// (Stopped explicitly once: a hit that ends must not leave the motors at its last level.)
+		if (was_live) g_controller->SetVibration(0, 0);
+		return;
+	}
+	const auto to_motor = [](float value) { return static_cast<uint8_t>(std::clamp(value * gain, 0.0f, 1.0f) * 255.0f); };
+	const char* pad = g_controller->SetVibration(to_motor(held[0]), to_motor(held[1]));
+	// (Once a pad took it, and once the first time none did: whether the game's vibration reaches a pad.)
+	static bool noted = false, no_pad = false;
+	if (pad != nullptr ? !noted : !no_pad) {
+		(pad != nullptr ? noted : no_pad) = true;
+		std::printf("Pad rumble: the game's vibration %s%s (no DualSense haptics; KYTY_PAD_RUMBLE_GAIN %.1f)\n",
+		            pad != nullptr ? "drives the motors of " : "has no pad that takes rumble",
+		            pad != nullptr ? pad : "", static_cast<double>(gain));
+		std::fflush(stdout);
+	}
 }
 
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {

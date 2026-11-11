@@ -1,9 +1,8 @@
-﻿# Windows launcher: runs the Windows build with the switches of a launch config.
-#   .\run-windows.ps1                        the release package's switches (run-windows.json), 2560x1440
+﻿# Windows launcher: runs the Windows build with the command line of a launch config.
+#   .\run-windows.ps1                        the release package's command line (run-windows.json), 2560x1440
 #   .\run-windows.ps1 -Precompile            compile every recorded shader and pipeline, then exit
 #                                            (every shader of the game: precompile-windows.ps1)
-#   .\run-windows.ps1 -Baseline              no performance switches
-#   .\run-windows.ps1 -Config <launch.json>  another checkpoint's switches
+#   .\run-windows.ps1 -Config <launch.json>  another launch config
 #   .\run-windows.ps1 -Width 1920 -Height 1080 -Fullscreen
 #   .\run-windows.ps1 -NoRedZone             without guest red-zone protection
 #   .\run-windows.ps1 -Patch <cheat.json>    apply an etaHEN-style game patch
@@ -12,23 +11,44 @@
 #                                            told the TV takes HDR and outputs it; SDR otherwise)
 #   .\run-windows.ps1 -Language 11           the console language (0-29 as the PS5 numbers them: 1 English (US),
 #                                            11 Chinese (Simplified); default: the config's)
-#   .\run-windows.ps1 -Set KEY=VALUE         override a switch of the config (KEY= removes it)
+#   .\run-windows.ps1 -Set KEY=VALUE         an emulator switch (KYTY_*; the defaults are the emulator's own,
+#                                            src/local/performance-switches.h; KEY= removes one the config sets)
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
 #                                            frame (2x; up to 5, at most what the GPU makes); needs
 #                                            NVIDIA's Streamline runtime (-StreamlineDir)
+#   .\run-windows.ps1 -Upscaler dlss         DLSS super resolution: Demon's Souls' own PS5 Pro path (its 3D at
+#                                            2688x1512 or -RenderHeight, 1080 and up or 720), DLSS in place of Sony's
+#                                            upscaler making the 3840x2160 image; NVIDIA's Streamline runtime
+#   .\run-windows.ps1 -Upscaler fsr          the same with AMD's FSR 3 built in (any graphics card, nothing to download);
+#                                            with AMD's FSR SDK 2.4 DLLs next to the emulator, FSR 4 on Radeon RX 7000/9000
 #   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is (the Streamline SDK
 #                                            or its bin\x64; default: a "streamline" folder next to
 #                                            the emulator)
+#   .\run-windows.ps1 -Fsr                   AMD FSR frame generation instead (2x, any GPU): AMD's FSR SDK 2.4 DLLs
+#                                            (FSR 4 on Radeon RX 9000) or amd_fidelityfx_vk.dll next to the emulator
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
 #                                            virtual vblank; movies, menus and loading screens keep 60)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
+#   .\run-windows.ps1 -LowLatency            one frame queued instead of about two: what you press shows sooner (at
+#                                            60 Hz 15-23 ms from the game's frame to the screen instead of ~30); a late
+#                                            frame is no longer covered by a queued one (KYTY_LOW_LATENCY)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
+#   .\run-windows.ps1 -HdOutput              Demon's Souls' own 1080p mode (a PS5's on a 1080p TV): its post-processing
+#                                            and HUD at 1920x1080 instead of 3840x2160, its 3D at most 1080 high; less
+#                                            work for the GPU (not with -Upscaler dlss, whose output is 4K)
+#   .\run-windows.ps1 -Upscaler dlss -OutputHeight 1440   the upscaler's output (and the frame on it) at 2560x1440
+#                                            instead of 3840x2160, for a 1440p screen (1080-2159; the HUD in its HD
+#                                            layout scaled to it); -RenderHeight picks the mode (1440 DLAA, 960 Quality)
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
 #                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
-#                                            its sides unstretched, in-game menus stretched), movies at 16:9
+#                                            its sides unstretched; menus and movies stretched, or with -AspectFit
+#                                            movies, the title and loading screens kept at 16:9 with black bars)
 #   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: shorter shadows and
 #                                            distant detail): faster where the CPU limits
+#   .\run-windows.ps1 -Antialiasing off      Demon's Souls without its own anti-aliasing (TAA) and the camera jitter
+#                                            that goes with it: a sharp picture with jagged edges (with the game's own
+#                                            upscaler only; at a render height equal to the output, nothing is scaled)
 #   .\run-windows.ps1 -TextureReduce 1       large textures without their largest level: half the size per side
 #                                            (2: a quarter; 0: whole), less video memory and upload; default 1
 #                                            with less than 12 GB of video memory, else 0 (the launcher's Graphics
@@ -44,7 +64,7 @@
 #   .\run-windows.ps1 -DryRun                print environment and command only
 # A release package (.github/workflows/build.yml) has its kyty_emulator.exe and launch.json next to this
 # script: those are used instead of the build tree's. A build tree takes run-windows.json (the release
-# package's switches; an older _Build\release-stage1-20260927\launch.json lacks the table modes).
+# package's launch.json).
 param(
 	[string]$Config = $(@("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
 	                    Select-Object -First 1),
@@ -54,25 +74,32 @@ param(
 	[int]$Height = 0,
 	[switch]$Fullscreen,
 	[switch]$Hdr,
-	[switch]$Baseline,
 	[switch]$Precompile,
 	[int]$Threads = 0,
 	[switch]$NoRedZone,
-	[switch]$NoAot,
 	[string]$PresentMode = '',
 	[int]$Vblank = 0,
 	[switch]$Fps120,
+	[switch]$LowLatency,
+	[switch]$KeyboardMouseControls,
+	[string]$KeyboardMouseBindings = '',
 	[int]$RenderHeight = 0,
+	[switch]$HdOutput,
+	[int]$OutputHeight = 0,
 	[string]$Aspect = '',
 	[string]$Quality = '',
+	[ValidateSet('', 'off')][string]$Antialiasing = '',
 	[string]$TextureReduce = '',
 	[string[]]$Set = @(),
 	[string]$Patch = '',
 	[switch]$AspectFit,
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
+	[ValidateSet('', 'dlss', 'fsr')][string]$Upscaler = '',
 	[string]$StreamlineDir = '',
+	[switch]$Fsr,
 	[string]$Affinity = '',
+	[string]$Gpu = '',
 	[switch]$Prompt,
 	[switch]$Follow,
 	[switch]$DryRun
@@ -199,6 +226,42 @@ function Set-Option([string]$name, [string]$value) {
 	$at = $options.IndexOf($name)
 	if ($at -ge 0) { $options[$at + 1] = $value } else { $options.Add($name); $options.Add($value) }
 }
+# The launcher's keyboard prompt artwork matches the requested layout. Append its bindings only
+# for this launch: the emulator resolves conflicts in favour of the last mapping.
+# Existing sensitivity and non-conflicting mouse-wheel bindings remain intact.
+# launch.json is never rewritten; switching off restores the user's normal bindings.
+if ($KeyboardMouseControls) {
+	$bindings = @(
+		'Cross=E', 'Circle=Space', 'Square=R', 'Triangle=F',
+		'L1=Left Shift', 'L2=Left Ctrl', 'L3=X',
+		'R1=Mouse:Left', 'R2=Mouse:Right', 'R3=Mouse:Middle', 'Options=Escape',
+		'Up=Up', 'Down=Down', 'Left=Left', 'Right=Right',
+		'TouchPad=Tab', 'TouchPadRight=Backspace',
+		'LeftStickUp=W', 'LeftStickDown=S', 'LeftStickLeft=A', 'LeftStickRight=D'
+	)
+	if ($KeyboardMouseBindings) {
+		$custom = ConvertFrom-Json -InputObject ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($KeyboardMouseBindings)))
+		if ($custom -isnot [array]) { throw 'Invalid keyboard layout' }
+		$controls = @($bindings | ForEach-Object { ($_ -split '=',2)[0] })
+		$seen = @{}; $inputs = @{}
+		foreach ($binding in $custom) {
+			if ($binding -isnot [string] -or $binding -notmatch '^([A-Za-z][A-Za-z0-9]*)=([A-Za-z0-9: .+*/=\\;,\[\]''`-]+)$') { throw 'Invalid keyboard binding' }
+			$control,$inputName = $binding -split '=',2
+			if ($seen.ContainsKey($control)) { throw "Duplicate keyboard control: $control" }
+			$seen[$control] = $true
+			if ($control -eq 'MouseSensitivity') {
+				$number = 0.0
+				if (![double]::TryParse($inputName,[Globalization.NumberStyles]::AllowDecimalPoint,[Globalization.CultureInfo]::InvariantCulture,[ref]$number) -or $number -lt 0.1 -or $number -gt 5) { throw 'Invalid mouse sensitivity' }
+			} else {
+				if ($control -cnotin $controls -or $inputs.ContainsKey($inputName) -or $inputName -in @('F7','F8','F11','Pause')) { throw 'Invalid or conflicting keyboard binding' }
+				$inputs[$inputName] = $true
+			}
+		}
+		if (@($controls | Where-Object { !$seen.ContainsKey($_) }).Count) { throw 'Incomplete keyboard layout' }
+		$bindings = $custom
+	}
+	foreach ($binding in $bindings) { $options.Add('--keymap'); $options.Add($binding) }
+}
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
@@ -219,37 +282,10 @@ if ($Patch) { Set-Option '--game-patch' (Resolve-Path $Patch).Path }
 # then corrupt guest locals; --redzone rewrites the guest's red-zone accesses at load time.
 if (!$NoRedZone) { $options.Add('--redzone') }
 
-# Environment switches. The ahead-of-time SRT library of a Linux config is a .so: use the DLL
-# built from the same plan sources (tools\local\compile-srt-aot-windows.py <library dir>).
+# Environment switches: the config's (the emulator's own defaults are the release settings).
 $environment = [ordered]@{}
-if (!$Baseline) {
-	foreach ($property in $launch.environment.PSObject.Properties) {
-		if ($property.Name -eq 'KYTY_SRT_AOT_LIBRARY') {
-			if ($NoAot) { continue }
-			$relative = ([string]$property.Value -replace '^.*?/_Build/', '_Build/') -replace 'srt-aot\.so$', 'srt-aot.dll'
-			$dll = Join-Path $PSScriptRoot $relative
-			# A library built on Windows from this tree's own plan exports (KYTY_SRT_AOT_EXPORT, then
-			# compile-srt-aot-windows.py) matches plans the Linux one misses: the walk's plans
-			# changed since it was built (28% of them ran in the interpreter).
-			$windows = Get-ChildItem "$PSScriptRoot\_Build\srt-aot\windows-libraries\*\srt-aot.dll" -ErrorAction SilentlyContinue |
-				Sort-Object LastWriteTime -Descending | Select-Object -First 1
-			if ($windows) { $dll = $windows.FullName }
-			if (Test-Path $dll) {
-				$environment[$property.Name] = (Resolve-Path $dll).Path
-			} else {
-				Write-Host "SRT AOT: $relative missing; build it with tools\local\compile-srt-aot-windows.py"
-			}
-			continue
-		}
-		$environment[$property.Name] = [string]$property.Value
-	}
-	# A build tree with an SRT AOT library built here (tools\local\compile-srt-aot-windows.py) uses it also when
-	# the config names none (run-windows.json: release packages have none).
-	if (!$NoAot -and !$environment.Contains('KYTY_SRT_AOT_LIBRARY')) {
-		$windows = Get-ChildItem "$PSScriptRoot\_Build\srt-aot\windows-libraries\*\srt-aot.dll" -ErrorAction SilentlyContinue |
-			Sort-Object LastWriteTime -Descending | Select-Object -First 1
-		if ($windows) { $environment['KYTY_SRT_AOT_LIBRARY'] = $windows.FullName }
-	}
+foreach ($property in $launch.environment.PSObject.Properties) {
+	$environment[$property.Name] = [string]$property.Value
 }
 
 # CPU affinity: -Affinity, else the config's list (this PC's leaves CPUs 4 and 5 out), else every
@@ -264,67 +300,56 @@ for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $c
 
 # The render thread on the recording worker's CPUs (this PC's P-cores without CPU 0, which takes
 # most interrupts on Windows): +2.5% over free placement in the fixed scene. Pinning it to CPU 0
-# alone, as on Linux, halved the frame rate here. A config without them leaves both to Windows;
-# "auto" (the portable package's config) picks the performance cores of this PC (below).
-if (!$environment.Contains('KYTY_RENDER_CPUS') -and $environment.Contains('KYTY_RECORDING_CPUS')) {
-	$environment['KYTY_RENDER_CPUS'] = $environment['KYTY_RECORDING_CPUS']
-}
-
-# Image staging copies on the upload worker too (KYTY_ASYNC_UPLOAD=2): streamed textures were
-# up to 4 MB of backing reads a frame on the render thread while walking.
-if ($environment['KYTY_ASYNC_UPLOAD'] -eq '1') { $environment['KYTY_ASYNC_UPLOAD'] = '2' }
-# Retired buffers' memory is freed on a worker (a kernel call per dedicated allocation).
-if (!$environment.Contains('KYTY_BUFFER_RECLAIM') -and !$Baseline) { $environment['KYTY_BUFFER_RECLAIM'] = '1' }
-# Ordinary indexed/auto draws recorded as packets too (about 1.3 ms a frame less render time).
-if (!$environment.Contains('KYTY_DRAW_PACKETS') -and !$Baseline) { $environment['KYTY_DRAW_PACKETS'] = '1' }
-# A CPU write into a large image re-uploads only the written part: the game streams textures one
-# layer at a time into 320-352 MiB arrays, and each layer re-uploaded the whole array (20-70 ms).
-if (!$environment.Contains('KYTY_PARTIAL_IMAGE_DIRTY') -and !$Baseline) { $environment['KYTY_PARTIAL_IMAGE_DIRTY'] = '1' }
-# ... and inside a large subresource only the rows of tile blocks over the written ranges: an
-# 8192x8192 streamed texture's mip 0 is 64 MiB of 85, and picking it whole re-uploaded all of it.
-if (!$environment.Contains('KYTY_PARTIAL_ROW_BANDS') -and !$Baseline) { $environment['KYTY_PARTIAL_ROW_BANDS'] = '1' }
-# Native XPR pipeline variants compile on worker threads; their draws take the normal path until
-# then. Entering a new area compiled dozens at once on the render thread (a 200 ms frame).
-if (!$environment.Contains('KYTY_ASYNC_XPR_PIPELINES') -and !$Baseline) { $environment['KYTY_ASYNC_XPR_PIPELINES'] = '1' }
-# Direct draws whose objects point at a new copy of their tables every frame keep their native XPR
-# records (the pointer leaves the key): Latria 33 -> 37 fps, Boletaria 1-1 31 -> 32.
-if (!$environment.Contains('KYTY_NATIVE_XPR_RELOCATE') -and !$Baseline) { $environment['KYTY_NATIVE_XPR_RELOCATE'] = '1' }
-# At most 256 native XPR record stores a frame (about 16 us each): walking brings a thousand or more new objects
-# and LODs a frame, and storing them all at once made 60-90 ms frames (Latria walk 1% low 14.1 -> 16.4 fps).
-if (!$environment.Contains('KYTY_NATIVE_XPR_STORE_BUDGET') -and !$Baseline) { $environment['KYTY_NATIVE_XPR_STORE_BUDGET'] = '256' }
-# Native XPR records stay 600 frames unused (2 before): a turn of the camera no longer drops every record
-# behind it (camera turning in place: Latria 35.2 -> 39.1 fps, Boletaria 1-1 42.0 -> 47.0).
-if (!$environment.Contains('KYTY_NATIVE_XPR_KEEP_FRAMES') -and !$Baseline) { $environment['KYTY_NATIVE_XPR_KEEP_FRAMES'] = '600' }
-# The instances of a mesh keep their native XPR records whatever order a frame draws them in: once an object's
-# record rebinds its descriptors, its relocated key holds its descriptor bases (Latria camera turning in place
-# 42.95 -> 45.33 fps, 1% low 27.95 -> 30.02; standing 39.13 -> 38.73).
-if (!$environment.Contains('KYTY_NATIVE_XPR_INSTANCES') -and !$Baseline) { $environment['KYTY_NATIVE_XPR_INSTANCES'] = '1' }
-# Demon's Souls' own engine settings, added to the command-line file it reads at boot (src/loader/gameArgs.h):
-# no XPR index-buffer culling, a GPU pass that culls every object's triangles (~2800 compute dispatches a
-# frame at Boletaria 1-1) before drawing them; the PC GPU draws them all instead, the image unchanged
-# (same process at Boletaria 1-1: standing 34.30 -> 36.48 fps, camera turning +0.8%; GPU 60 -> 71% busy).
-if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = 'doIndexBufferCulling=false' }
+# alone, as on Linux, halved the frame rate here. "auto" (the default) picks the performance cores of this PC
+# (below); a CPU of one kind of core leaves both to Windows.
+if (!$environment.Contains('KYTY_RECORDING_CPUS')) { $environment['KYTY_RECORDING_CPUS'] = 'auto' }
+if (!$environment.Contains('KYTY_RENDER_CPUS')) { $environment['KYTY_RENDER_CPUS'] = $environment['KYTY_RECORDING_CPUS'] }
 # -RenderHeight: the height Demon's Souls' performance mode renders its 3D at (src/loader/demonsSoulsRenderSize.h);
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
-if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# Without it the height follows the window: its own height, 720 to the game's 1440 (with -Upscaler the window's / 1.5,
+# at least 1080). A height given is passed as given, 1440 too, so the window's size does not change a choice.
+if ($RenderHeight -gt 0) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# -HdOutput: the game's 1080p output (src/loader/demonsSoulsHdOutput.h). A 1440 render height (the default) becomes 1080.
+if ($HdOutput) { $environment['KYTY_HD_OUTPUT'] = '1' }
+# -OutputHeight: the PS5 Pro path's output at that height (KYTY_OUTPUT_HEIGHT, src/loader/demonsSoulsHdOutput.h), with
+# -Upscaler only.
+if ($OutputHeight -gt 0) { $environment['KYTY_OUTPUT_HEIGHT'] = "$OutputHeight" }
+# -Gpu: the graphics card on a PC with more than one, its number in the log's "Vulkan GPU <n>:" list or a part of its
+# name (-Gpu 4090); without it the first discrete GPU, in the order Windows' graphics settings give (issue #132). Give
+# precompile-windows.ps1 the same -Gpu: the pipelines are compiled for one card.
+# (Set here already: the precompile program's runs below, the prefetch inputs, are made for that card too.)
+if ($Gpu) { $environment['KYTY_GPU'] = $Gpu; $env:KYTY_GPU = $Gpu }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
-# projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.
+# projection widened to match; the presenter shows every frame at the aspect (movies and menus stretched).
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }
 # -Quality low|lowest: Demon's Souls engine settings that cut what a frame draws, for PCs whose CPU limits the frame
 # rate (each draw costs the emulator CPU time). low: levels of detail chosen as for a 720-line picture (1080), sun
 # shadows to 125 m (250); lowest: detail as for 480 lines, sun shadows to 60 m, no ambient shadowing, no shadows from
-# torches and other spot lights. A laptop Ryzen 9 5900HX + RTX 3080 standing at the Gates of Boletaria, at 1440:
-# standard 21.9 fps, lowest 25.6. Not r_forceShadowLOD (until 10-17 in both): it draws objects with their shadow
-# meshes, and objects without one vanish (carts and barricades at the Gates of Boletaria; issue #40), for 6% more.
+# torches and other spot lights, no projected decals (blood, scorch marks: 10-28, RTX 5090 at 1-1 on lowest, standing
+# 86.1 -> 96.1 fps, walking 89.2 -> 95.6, the GPU's frame -22%; on a Steam Deck +7% at 360p). A laptop Ryzen 9 5900HX
+# + RTX 3080 standing at the Gates of Boletaria, at 1440: standard 21.9 fps, lowest 25.6 (before the decals). Not
+# r_forceShadowLOD (until 10-17 in both): it draws objects with their shadow meshes, and objects without one vanish
+# (carts and barricades at the Gates of Boletaria; issue #40), for 6% more.
 $qualityConvars = @{
 	low    = 'r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
-	lowest = 'r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
+	lowest = 'r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false;r_projectedDecalEnable=false'
 }
 if ($Quality -and $Quality -ne 'standard') {
 	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
 	if ($titleId -match '^PPSA0134[0-2]$') {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars[$Quality]) | Where-Object { $_ }) -join ';'
+	}
+}
+# -Antialiasing off (issue #220): Demon's Souls' TAA off (r_aaMethod 0) and its projection jitter with it, which TAA
+# alone left on: a still scene's edges moved from frame to frame (8.5% of its pixels changed, 1% with the jitter off).
+# Not with -Upscaler: DLSS and FSR take the game's PS5 Pro path, whose upscaler is the anti-aliasing.
+if ($Antialiasing -eq 'off' -and $titleId -match '^PPSA0134[0-2]$') {
+	if ($Upscaler) {
+		Write-Warning "-Antialiasing off is for the game's own upscaler: left out with -Upscaler $Upscaler"
+	} else {
+		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'r_aaMethod=0;r_aaEnableTemporalProjectMatrixJitter=false') |
+			Where-Object { $_ }) -join ';'
 	}
 }
 # -TextureReduce 0|1|2: large block-compressed textures held without their 1 or 2 largest levels (KYTY_TEXTURE_REDUCE;
@@ -334,39 +359,28 @@ if ($TextureReduce -ne '') {
 	if ($TextureReduce -notin '0', '1', '2') { throw "-TextureReduce takes 0, 1 or 2, not '$TextureReduce'" }
 	$environment['KYTY_TEXTURE_REDUCE'] = $TextureReduce
 }
-# Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
-# by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
-if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }
-# The key of the driver pipeline cache (_PipelineCache\local\<key>); it also enables the shader
-# warmup, which a modified source tree runs without otherwise. One key for every build: the driver
-# finds a pipeline by its whole input (SPIR-V and state), so a new build reuses the pipelines of the
-# shaders it left alone. Keyed by the executable's SHA-256, every update compiled the ~3700 warmup
-# pipelines again (2-2.5 minutes of "Preparing pipelines").
-$environment['KYTY_DRIVER_CACHE_KEY'] = '1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97'
 if ($Precompile) {
 	# Translate every recorded shader and create every recorded pipeline on all allowed CPUs,
 	# save the driver cache, exit. Later launches warm up from that cache in seconds.
 	$environment['KYTY_SHADER_WARMUP'] = '1'
 	$environment['KYTY_SHADER_WARMUP_ONLY'] = '1'
 	$environment['KYTY_SHADER_WARMUP_THREADS'] = "$cpus"
-	$environment.Remove('KYTY_SHADER_WARMUP_SECONDS')
 } else {
 	# An earlier -Precompile in the same shell leaves this set; the game must not exit after warmup.
 	Remove-Item env:KYTY_SHADER_WARMUP_ONLY -ErrorAction SilentlyContinue
-	# At most a minute of start-up warmup: with an empty driver cache (the first launch, a driver
-	# update) its ~4400 pipelines took 4.5 minutes; the rest are built at their first use (a fast
-	# unoptimized build at once, the optimized one in the background) and cached from then on.
-	if (!$environment.Contains('KYTY_SHADER_WARMUP_SECONDS')) { $environment['KYTY_SHADER_WARMUP_SECONDS'] = '60' }
 }
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
-# Stutters in the log: frames, shader translations and pipeline creations of 100 ms or more (SLOW lines;
-# what runs per frame or on a cache miss only, so nothing measurable).
-if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
+# -LowLatency: src/graphics/presentation/videoOut.cpp's FlipQueue (fc1e9cf4).
+if ($LowLatency) { $environment['KYTY_LOW_LATENCY'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# -Upscaler dlss|fsr: src/loader/demonsSoulsSuperResolution.h (fsr: src/local/fsr-native.h).
+if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
+# -Fsr: FSR 3.1 (one generated frame; no Streamline).
+if ($Fsr) { $environment['KYTY_FRAMEGEN'] = '1'; $environment['KYTY_FRAMEGEN_BACKEND'] = 'fsr'; $FrameGen = 0 }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
 # it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
-if (!$StreamlineDir -and $FrameGen -gt 0 -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
+if (!$StreamlineDir -and ($FrameGen -gt 0 -or $Upscaler -eq 'dlss') -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
 	$chosen = try { [string](Get-Content "$PSScriptRoot\launcher-settings.json" -Raw | ConvertFrom-Json).streamline } catch { '' }
 	if ($chosen -and (Test-Path $chosen)) { $StreamlineDir = $chosen }
 }
@@ -375,7 +389,11 @@ if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' })) {
 	$key, $value = $pair -split '=', 2
-	if ($value) { $environment[$key] = $value } else { $environment.Remove($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
+	# (KEY= removes what the config or this script set; for the emulator's own defaults it turns the path off, 0, as it
+	# did when they were set here: -Set KYTY_TABLE_XPR=,KYTY_TABLE_DISPATCH= in issue replies.)
+	if ($value) { $environment[$key] = $value }
+	elseif ($environment.Contains($key)) { $environment.Remove($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
+	else { $environment[$key] = '0' }
 }
 # Above 60 Hz (-Fps120, -Vblank; after -Set, whose engine settings get it too): Demon's Souls steps its game by at
 # least a frame of its target rate each frame (gameMinDeltaTime below 0, its default: 1/60 s, the cinematic mode's
@@ -435,7 +453,7 @@ $quoted = @('--game', "`"$Game`"") + ($options | ForEach-Object { if ($_ -match 
 $logDir = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $($testedVersions -join ' and '))" })"
-Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
+Write-Host "config:   $Config$(if ($Precompile) { ' (precompile)' })"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs){2}" -f $mask, $cpus, $(if ($environment['KYTY_RENDER_CPUS']) { "; render threads on CPUs $($environment['KYTY_RENDER_CPUS'])" }))
 Write-Host "switches: $($environment.Count)"
 Write-Host "command:  $Exe $($quoted -join ' ')"
@@ -495,8 +513,13 @@ if ($shaders) {
 	# behind after a merge).
 	# Outdated: made from the seeds of an older precompile program, which listed fewer of the game's shaders.
 	$cacheOutdated = $status -match 'static cache outdated'
-	$cacheReady = $status -match 'static cache current' -and
-		!(Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.shard*" -ErrorAction SilentlyContinue | Where-Object Length -gt 1MB)
+	# A shard older than its store is left from an earlier run, not an unfinished one: another graphics driver's, which
+	# no merge takes (issue #126: six of them made every start offer the precompile again).
+	$unfinished = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.shard*" -ErrorAction SilentlyContinue | Where-Object {
+		$store = Join-Path $_.DirectoryName ($_.Name -replace '\.shard.*$', '')
+		$_.Length -gt 1MB -and !((Test-Path -LiteralPath $store) -and (Get-Item -LiteralPath $store).LastWriteTime -gt $_.LastWriteTime)
+	}
+	$cacheReady = $status -match 'static cache current' -and !$unfinished
 	Write-Host "shaders:  prefetch inputs $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } elseif ($cacheOutdated) { 'out of date (precompile-windows.ps1 compiles what is new)' } else { 'not made (precompile-windows.ps1)' })"
 }
 
@@ -509,7 +532,11 @@ if ($Prompt -and ($offer -or !$tested)) {
 	if ($offer) {
 		$minutes = [math]::Ceiling(55 * 22 / $cpus / 10) * 10
 		$time = if ($minutes -lt 90) { "about $minutes minutes" } else { 'about {0:N1} hours' -f ($minutes / 60) }
-		$message = if ($cacheOutdated) {
+		# (next precompile all: the precompiled shaders lack a translation that changes nearly every shader, issue #246.)
+		$message = if ($cacheOutdated -and $status -match 'next precompile all') {
+			"$info`n`nThis version of the emulator translates the game's shaders differently from the one that made the precompiled shaders on this PC (a newer translation), so a precompile now compiles all of them again, once: $time on this PC, with the CPU fully loaded (closing its window stops it, and the next run continues).`n" +
+				"Until then the current precompiled shaders stay in use: starting the game now is fine."
+		} elseif ($cacheOutdated) {
 			"$info`n`nThis version of the emulator precompiles more of the game's shaders than the one that made the precompiled shaders on this PC: the new ones would stutter the first time they appear.`n" +
 				"Precompiling again compiles only what is new (minutes; at most $time on this PC, with the CPU fully loaded; closing its window stops it, and the next run continues)."
 		} else {

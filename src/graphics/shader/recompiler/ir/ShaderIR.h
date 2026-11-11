@@ -117,10 +117,12 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
-	// indirect_search_iterations of a portable table (PortableShaders): the search runs until its
+	// indirect_search_iterations of a portable table: the search runs until its
 	// range is empty, and indirect_mapping_offset names the flattened-SRT word that holds the
 	// offset of the key mapping.
 	static constexpr uint32_t RuntimeIndirectSearch = UINT32_MAX;
+	// max_array_index when no bound of an array image's layer coordinate was shown.
+	static constexpr uint32_t NoArrayIndexBound = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      first_use_pc      = 0;
@@ -140,6 +142,10 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// A sampled array image's largest layer the shader can read, counted from the view's base layer (ResourceTracking:
+	// every sample and gather of it takes its layer coordinate from values of a known range). Its view needs no layer
+	// past it (descriptors.cpp TextureViewInfo).
+	uint32_t                      max_array_index = NoArrayIndexBound;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -417,12 +423,10 @@ struct BufferWord {
 	static constexpr uint32_t PackedLayouts = 12;
 };
 
-// Portable shader modules (KYTY_PORTABLE_SHADERS, default on; read once, fixed for the process):
-// what a module could only get from the descriptors the game binds at run time (a buffer's stride
-// and format, a null texture's type) no longer selects one, so the modules of a program can be
-// compiled ahead from the game files (tools/local/static-precompile). Buffers take those values
-// from their buffer words (BufferWord) in the shader data.
-bool PortableShaders();
+// Portable shader modules: what a module could only get from the descriptors the game binds at run
+// time (a buffer's stride and format, a null texture's type) no longer selects one, so the modules
+// of a program can be compiled ahead from the game files (tools/local/static-precompile). Buffers
+// take those values from their buffer words (BufferWord) in the shader data.
 
 inline constexpr uint32_t BufferAddTidBit = 1u << 20u;
 
@@ -696,14 +700,13 @@ struct Program: ResourcePlan {
 	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
 	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
 	bool                          lane_local     = false;
-	// Its proof took buffer loads at one address for values the same in every lane: two lanes per invocation after
-	// all where the specialization has a buffer that adds the lane to its index (ADD_TID; CompileProgram).
-	bool                          lane_local_uniform_loads = false;
 	// Its proof had a 64-thread group's two halves cooperate (Frontend::ProveWaveLaneLocal): these lane reads (pc)
 	// run wave-wide and these lane-mask branches (pc of the branch) are the wave's decision (IR::WaveFlags).
 	bool                          lane_cooperative = false;
 	std::vector<uint32_t>         cooperative_reads;
 	std::vector<uint32_t>         cooperative_branches;
+	// A lane-local program's LDS accesses: the PCs a workgroup barrier goes before (Frontend::LdsBarriers).
+	std::vector<uint32_t>         lds_barriers;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
@@ -721,6 +724,20 @@ struct Program: ResourcePlan {
 	// page table at run time, user data from push constants; no flattened SRT, buffer or shader-data binding.
 	bool                          table_mode = false;
 	TablePlan                     table_plan;
+	// Table mode: each slot loaded where the shader reads it (Frontend::TranslatorFeatureTableSlotsAtUse), not all of
+	// them at the entry.
+	bool                          table_slots_at_use = false;
+	// Float min/max as host instructions (Frontend::TranslatorFeatureNativeFloatMinMax).
+	bool                          native_float_min_max = false;
+	// Address loads from one base share a page walk (Frontend::TranslatorFeatureBdaGroupWalks).
+	bool                          bda_group_walks = false;
+	// Pixel shaders' DPP quad_perm moves read by quad operations (Frontend::TranslatorFeaturePixelQuadReads).
+	bool                          pixel_quad_reads = false;
+	// V_MAD/V_MAC/V_MADMK/V_MADAK_F32 (FPMad32) unfused (Frontend::TranslatorFeatureUnfusedMad).
+	bool                          unfused_mad = false;
+	// A pixel shader's barycentrics without per-vertex inputs from VK_AMD_shader_explicit_vertex_parameter
+	// (Frontend::TranslatorFeatureAmdBarycentrics; the backend checks for the per-vertex inputs).
+	bool                          amd_barycentrics = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

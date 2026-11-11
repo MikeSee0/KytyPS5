@@ -9,9 +9,12 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -38,6 +41,8 @@ public:
 		return m_page_manager.WatchedSpan(vaddr, size, first, end);
 	}
 	void SyncProtection(uint64_t vaddr, uint64_t size) { m_page_manager.SyncProtection(vaddr, size); }
+	// KYTY_READ_GUARD: the page's trackers' protection after its read guard's fault was served (PageManager).
+	void SettleProtection(uint64_t vaddr) { m_page_manager.SettleProtection(vaddr); }
 	// (PageManager::WatchedRuns: for a holder of the guest address-space lock.)
 	void WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<PageManager::WatchedRun>* runs) const {
 		m_page_manager.WatchedRuns(vaddr, size, runs);
@@ -48,11 +53,7 @@ public:
 	// Before a host write of the whole range: GPU-written bytes it replaces are dropped (BufferCache::InvalidateMemoryForWrite).
 	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// Before a host write of the range: the images over it only (their bytes are rewritten, as InvalidateMemory does).
-	[[nodiscard]] bool InvalidateImages(uint64_t vaddr, uint64_t size) {
-		if (!IsMapped(vaddr, size)) return false;
-		m_texture_cache.InvalidateMemory(vaddr, size);
-		return true;
-	}
+	[[nodiscard]] bool InvalidateImages(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// The mapped parts of [vaddr, vaddr + size), added to `out`.
 	void               MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
@@ -60,6 +61,11 @@ public:
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.
 	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
+	// The game freed the range and keeps it mapped (LibKernel::Memory::NoteGameFree): queued for the GPU thread, whose
+	// commands run before any later submission (and between the packets of the one under way), without waiting. The
+	// buffers it holds go as for an unmap (BufferCache::DropFreedRange). KYTY_ENGINE_FREE_BUFFERS=0: nothing; =2: their
+	// GPU-written bytes dropped instead of read back first.
+	void               FreedByGame(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void BeginAliasWrite() noexcept;
 	void EndAliasWrite() noexcept;
@@ -91,6 +97,24 @@ private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size);
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
+	// Fresh memory (src/local/fresh-memory.h): the never-written granules of a mapping the CPU and the GPU may use,
+	// write-watched until their first write (MapMemory), unwatched when unmapped (UnmapMemory: `mark` counts them as
+	// written, as when the mapping stays without the watch), a first write's (HandleFault: true when it was one) and a
+	// host overwrite's (InvalidateMemoryForWrite) granules written. Each watched part is one granule's bytes in one
+	// mapping, by its guest address; the parts of a granule (all its mappings) go together.
+	void FreshWatch(uint64_t vaddr, uint64_t size);
+	void FreshUnwatch(uint64_t vaddr, uint64_t size, bool mark);
+	bool FreshFirstWrite(uint64_t vaddr);
+	void FreshOverwrite(uint64_t vaddr, uint64_t size);
+	void FreshUnwatchGranule(uint64_t granule); // (m_fresh_mutex held)
+	struct FreshPart {
+		uint64_t end     = 0;
+		uint64_t granule = 0;
+	};
+	std::mutex                                          m_fresh_mutex;
+	std::map<uint64_t, FreshPart>                       m_fresh_parts;    // by guest address
+	std::unordered_map<uint64_t, std::vector<uint64_t>> m_fresh_granules; // the addresses of the parts of a granule
+	uint64_t                                            m_fresh_report_flip = 0;
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;

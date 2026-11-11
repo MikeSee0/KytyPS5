@@ -92,6 +92,9 @@ constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
 constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
+// (The TEB's stack range on guest stacks, KYTY_GUEST_TEB_STACK_RANGE_ASM, which spells the numbers out.)
+static_assert(PTHREAD_STACK_TOP == Common::HostException::GuestStacksHigh &&
+              PTHREAD_STACK_BOTTOM == Common::HostException::GuestStacksLow);
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
@@ -1059,6 +1062,8 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
+	// Keeps the prologue before the host RSP snapshot below (PGO shrink-wrapping moved it after).
+	asm volatile("" ::: "rbx", "r12", "r13", "memory");
 	void*      ret = nullptr;
 	const auto aligned_stack_top =
 	    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
@@ -1137,9 +1142,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
+	             KYTY_GUEST_TEB_STACK_RANGE_ASM("10")
 #endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
@@ -3643,6 +3646,11 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// The game's name for the thread on the host's (15 characters on Linux): profiles, top and the Deck's
+	// tools/local/deck/deckprof.py tell its threads apart.
+	if (!thread->name.empty()) (void)pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
 	if (GuestThreadLog())
 		std::printf("GUEST-THREAD start %s (tid %" PRIu64 "): cpumask 0x%llx priority %d policy %d stack 0x%llx+0x%llx %s\n",
 		            thread->name.c_str(), os_thread_id, static_cast<unsigned long long>(thread->attr->affinity),

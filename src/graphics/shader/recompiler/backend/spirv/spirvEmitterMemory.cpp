@@ -220,7 +220,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+uint32_t LoadBdaEach(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
 	             uint32_t bits) {
 	auto&      state   = ctx.state;
 	const auto address = GuestAddress(ctx, inst, mem);
@@ -259,6 +259,95 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 		           : Binary(state, OpBitwiseAnd, TypeU32(state), merged,
 		                    ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
+}
+
+// A dword load from an address in a block where a load from the same base (registers, EXEC) walked the page table
+// already: the earlier one's host pointer plus the immediate offsets' difference, when the earlier address is dword
+// aligned and this one lies in its page. Otherwise (a page crossed, an unaligned base) LoadBdaEach walks again. The
+// components of a FLAT_LOAD_DWORDX4 or S_LOAD_DWORDX16 then walk once, not once (or twice) each.
+uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+	             uint32_t bits) {
+	auto& state = ctx.state;
+	if (bits != 32u || !state.program.bda_group_walks) {
+		return LoadBdaEach(ctx, inst, mem, bits);
+	}
+	ValueEmitContext::BdaWalk key;
+	key.block = inst.Parent();
+	key.kind  = static_cast<uint32_t>(mem.kind);
+	key.low   = ctx.Arg(inst, 1);
+	if (mem.address_is_full) {
+		key.high = ctx.Arg(inst, 2);
+	} else {
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2) {
+			return LoadBdaEach(ctx, inst, mem, bits);
+		}
+		key.handle_low  = ctx.Arg(*handle, 0);
+		key.handle_high = ctx.Arg(*handle, 1);
+	}
+	key.active    = ctx.Arg(inst, inst.NumArgs() - 1);
+	key.immediate = mem.kind == IR::ResourceKind::ScalarAddress
+	                    ? static_cast<int32_t>(mem.offset & ~3u)
+	                    : static_cast<int32_t>(mem.offset);
+
+	auto& walks = ctx.bda_walks;
+	if (!walks.empty() && walks.back().block != key.block) {
+		walks.clear();
+	}
+	const auto same = [&](const ValueEmitContext::BdaWalk& walk) {
+		return walk.kind == key.kind && walk.low == key.low && walk.high == key.high &&
+		       walk.handle_low == key.handle_low && walk.handle_high == key.handle_high &&
+		       walk.active == key.active;
+	};
+	constexpr auto page_size = static_cast<int64_t>(BufferCache::CACHING_PAGESIZE);
+	auto           found     = std::find_if(walks.rbegin(), walks.rend(), same);
+	if (found == walks.rend() || key.immediate - found->immediate <= -page_size ||
+	    key.immediate - found->immediate >= page_size) {
+		const auto address = GuestAddress(ctx, inst, mem);
+		key.pointer        = EmitValueOrDefaultIfCondition(state, key.active, TypeDeviceAddress(state),
+		                                                   ConstantDeviceAddress(state, 0),
+		                                                   [&]() { return GetBdaPointer(ctx, address); });
+		const auto low     = Unary(state, OpUConvert, TypeU32(state), address);
+		key.page_offset    = Binary(state, OpBitwiseAnd, TypeU32(state), low,
+		                            ConstantU32(state, static_cast<uint32_t>(page_size - 1)));
+		key.aligned        = Binary(state, OpIEqual, TypeBool(state),
+		                            Binary(state, OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, 3)),
+		                            ConstantU32(state, 0));
+		if (found != walks.rend()) {
+			*found = key;
+		} else {
+			walks.push_back(key);
+			found = walks.rbegin();
+		}
+	}
+	const auto walk  = *found;
+	const auto delta = key.immediate - walk.immediate;
+	// (The page offset plus the difference, as U32, is at most a page less a dword exactly when it lies in the page.)
+	const auto in_page =
+	    delta == 0 ? walk.aligned
+	               : AndCondition(state, walk.aligned,
+	                              Binary(state, OpULessThanEqual, TypeBool(state),
+	                                     Binary(state, OpIAdd, TypeU32(state), walk.page_offset,
+	                                            ConstantU32(state, static_cast<uint32_t>(delta))),
+	                                     ConstantU32(state, static_cast<uint32_t>(page_size) - 4u)));
+	const auto mapped = AndCondition(state, in_page,
+	                                 Binary(state, OpINotEqual, TypeBool(state), walk.pointer,
+	                                        ConstantDeviceAddress(state, 0)));
+	const auto shared = EmitValueOrZeroIfCondition(state, mapped, [&]() {
+		const auto address = delta == 0 ? walk.pointer
+		                                : Binary(state, OpIAdd, TypeDeviceAddress(state), walk.pointer,
+		                                         ConstantDeviceAddress(state, static_cast<uint64_t>(delta)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address});
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+		return value;
+	});
+	const auto own = EmitValueOrZeroIfCondition(state, Unary(state, OpLogicalNot, TypeBool(state), in_page),
+	                                            [&]() { return LoadBdaEach(ctx, inst, mem, bits); });
+	return Select(state, TypeU32(state), in_page, shared, own);
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1480,9 +1569,38 @@ uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index) {
 	return value;
 }
 
+// IR::Program::table_slots_at_use: a slot EmitTableMode leaves to the instruction that reads it (its value, a marker no id
+// has: the slot's load is emitted there, TableSlotValue).
+constexpr uint32_t TableSlotAtUse = UINT32_MAX;
+
+// The value EmitTableMode gives a slot the shader reads at the entry: its load there, or with table_slots_at_use none.
+// (1-1's dragon fire, 059438379702ee83: its 500 slots loaded at the entry stayed live through the whole program, values
+// GCN keeps in at most ~104 SGPRs, as registers of every invocation: 255 registers and 448 bytes of spills a thread on an
+// RTX 3080 Laptop, NVIDIA 566.07, 80 ms a frame, 270 with the cooperative halves' 64 invocations a wave. Loaded where it
+// is read, a slot lives as long as its SGPR did.)
+template <typename Load>
+static uint32_t TableSlotAtEntry(const EmitterState& state, uint32_t slot, const Load& load) {
+	return state.program.table_slots_at_use ? TableSlotAtUse : load(slot);
+}
+
+// A slot's value where the shader reads it: the entry's load, or (TableSlotAtUse) its load here.
+static uint32_t TableSlotValue(EmitterState& state, uint32_t slot) {
+	const auto value = state.table_slot_values[slot];
+	if (value != TableSlotAtUse) return value;
+	const auto address = TypeDeviceAddress(state);
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                           Binary(state, OpIAdd, address, state.table_block,
+	                                  ConstantDeviceAddress(state, uint64_t {slot} * 4))});
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), loaded, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+	return loaded;
+}
+
 // Table mode, at the function's entry: the slots the shader reads (IR::TablePlan::gpu) from its block (the block's
-// device address is two dwords of shader data, IR::BindingLayout::TableBlockDword), and each buffer's device
-// address, size in dwords, buffer word and stride (the renderer resolved the V#).
+// device address is two dwords of shader data, IR::BindingLayout::TableBlockDword), unless they are loaded where read
+// (TableSlotAtEntry), and each buffer's device address, size in dwords, buffer word and stride (the renderer resolved
+// the V#).
 void EmitTableMode(ValueEmitContext& ctx) {
 	auto&       state   = ctx.state;
 	const auto& program = state.program;
@@ -1502,7 +1620,7 @@ void EmitTableMode(ValueEmitContext& ctx) {
 	};
 	state.table_slot_values.assign(plan.slots.size(), 0);
 	for (size_t slot = 0; slot < plan.slots.size(); ++slot)
-		if (plan.gpu[slot] != 0) state.table_slot_values[slot] = load(static_cast<uint32_t>(slot));
+		if (plan.gpu[slot] != 0) state.table_slot_values[slot] = TableSlotAtEntry(state, static_cast<uint32_t>(slot), load);
 	// Each buffer as the renderer resolved it (IR::TablePlan::BufferDword).
 	for (size_t i = 0; i < plan.buffers.size(); ++i) {
 		const auto first       = plan.BufferDword(i);
@@ -1549,7 +1667,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// emit nothing.
 		const auto slot = inst.Arg(1).Resolve().U32();
 		ctx.Define(inst, slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
-		                     ? state.table_slot_values[slot]
+		                     ? TableSlotValue(state, slot)
 		                     : ConstantU32(state, 0));
 		return true;
 	}

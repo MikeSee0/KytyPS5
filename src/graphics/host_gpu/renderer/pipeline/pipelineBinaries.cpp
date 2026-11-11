@@ -4,10 +4,12 @@
 #include "local-platform.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <system_error>
+#include <utility>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -49,6 +51,58 @@ PipelineBinaries::Key KeyOf(const VkPipelineBinaryKeyKHR& key) {
 	return out;
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+// KYTY_PIPELINE_KEY_THUNK (default 1, 0: a direct call): vkGetPipelineKeyKHR through a thunk that keeps the callee-saved
+// registers in its own frame. NVIDIA 620.70.06 builds the global key (no create info) from 27 words in a stack buffer with
+// room for 26: the 27th, a 0/1 flag, lands on its own saved rbx, so the caller's rbx came back with its low 32 bits replaced
+// (Signature kept its result there: a SIGSEGV ~1 s into every boot, this = 0x7ffd00000000; PR #308). The thunk restores
+// rbx, rbp and r12-r15 from its own slots, out of the driver's reach, whichever of them a driver build's overflow lands on;
+// a driver without the fault sees the same call. (Entry rsp is 8 mod 16: six pushes and 8 bytes make the call's alignment.
+// Direct calls only; endbr64 for an indirect one under CET.)
+[[gnu::naked]] VkResult CallPipelineKeySaving(PFN_vkGetPipelineKeyKHR /*fn*/, VkDevice /*device*/,
+                                              const VkPipelineCreateInfoKHR* /*info*/, VkPipelineBinaryKeyKHR* /*key*/) {
+	asm("endbr64\n\t"
+	    "push %rbx\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %rbx, 0\n\t"
+	    "push %rbp\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %rbp, 0\n\t"
+	    "push %r12\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r12, 0\n\t"
+	    "push %r13\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r13, 0\n\t"
+	    "push %r14\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r14, 0\n\t"
+	    "push %r15\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r15, 0\n\t"
+	    "sub $8, %rsp\n\t.cfi_adjust_cfa_offset 8\n\t"
+	    "mov %rdi, %rax\n\t"
+	    "mov %rsi, %rdi\n\t"
+	    "mov %rdx, %rsi\n\t"
+	    "mov %rcx, %rdx\n\t"
+	    "call *%rax\n\t"
+	    "add $8, %rsp\n\t.cfi_adjust_cfa_offset -8\n\t"
+	    "pop %r15\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r15\n\t"
+	    "pop %r14\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r14\n\t"
+	    "pop %r13\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r13\n\t"
+	    "pop %r12\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r12\n\t"
+	    "pop %rbp\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %rbp\n\t"
+	    "pop %rbx\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %rbx\n\t"
+	    "ret");
+}
+
+bool UseKeyThunk() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_KEY_THUNK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+#endif
+
+// vkGetPipelineKeyKHR (`info` null: the global key); not loaded: VK_ERROR_FEATURE_NOT_PRESENT.
+VkResult GetPipelineKey(vk::Device device, const VkPipelineCreateInfoKHR* info, VkPipelineBinaryKeyKHR* key) {
+	const auto get_key = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR;
+	if (get_key == nullptr) return VK_ERROR_FEATURE_NOT_PRESENT;
+#if defined(__linux__) && defined(__x86_64__)
+	if (UseKeyThunk()) return CallPipelineKeySaving(get_key, static_cast<VkDevice>(device), info, key);
+#endif
+	return get_key(device, info, key);
+}
+
 } // namespace
 
 size_t PipelineBinaries::KeyHash::operator()(const Key& key) const {
@@ -63,8 +117,7 @@ PipelineBinaries::Handles::~Handles() {
 
 std::string PipelineBinaries::Signature(vk::Device device, const std::string& device_signature) {
 	VkPipelineBinaryKeyKHR key {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR == nullptr ||
-	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR(device, nullptr, &key) != VK_SUCCESS || key.keySize == 0) {
+	if (GetPipelineKey(device, nullptr, &key) != VK_SUCCESS || key.keySize == 0) {
 		return {};
 	}
 	std::string out = "KytyPipelineBinaries1" + device_signature + ":";
@@ -78,7 +131,7 @@ bool PipelineBinaries::PipelineKey(vk::Device device, const void* create_info, K
 	VkPipelineCreateInfoKHR info {VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR};
 	info.pNext = const_cast<void*>(create_info);
 	VkPipelineBinaryKeyKHR out {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR(device, &info, &out) != VK_SUCCESS || out.keySize == 0) {
+	if (GetPipelineKey(device, &info, &out) != VK_SUCCESS || out.keySize == 0) {
 		return false;
 	}
 	key = KeyOf(out);
@@ -195,6 +248,15 @@ bool PipelineBinaries::CreateBinaries(std::span<const uint32_t> indices, VkPipel
 		out[i] = VK_NULL_HANDLE;
 	}
 	return false;
+}
+
+bool PipelineBinaries::Intact(const Key& key) const {
+	const auto found = m_pipelines.find(key);
+	if (found == m_pipelines.end() || found->second.count == 0) return false;
+	std::vector<uint8_t> data;
+	for (uint32_t i = 0; i < found->second.count; i++)
+		if (!ReadData(m_binaries[m_refs[found->second.first + i]], data)) return false;
+	return true;
 }
 
 PipelineBinaries::Handles PipelineBinaries::Load(const Key& key) const {
@@ -358,58 +420,271 @@ size_t PipelineBinaryWriter::Pipelines() const {
 	return m_pipelines.size();
 }
 
-bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const std::string& signature) const {
+bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const std::string& signature,
+                                SaveReport* report) const {
 	std::lock_guard lock(m_mutex);
+	SaveReport      own;
+	auto&           out = report != nullptr ? *report : own;
+	out             = {};
 	std::error_code error;
 	std::filesystem::create_directories(file_path.parent_path(), error);
-	std::ofstream   file(file_path, std::ios::binary | std::ios::trunc);
-	const auto      signature_size = static_cast<uint32_t>(signature.size());
+	std::ofstream file(file_path, std::ios::binary | std::ios::trunc);
+	if (!file) {
+		out.failure = "the file could not be created";
+		return false;
+	}
+	const auto signature_size = static_cast<uint32_t>(signature.size());
 	file.write(Magic, sizeof(Magic));
 	file.write(reinterpret_cast<const char*>(&signature_size), sizeof(signature_size));
 	file.write(signature.data(), static_cast<std::streamsize>(signature.size()));
-	uint64_t    offset = sizeof(Magic) + sizeof(signature_size) + signature.size();
-	std::string tables;
+	uint64_t offset = sizeof(Magic) + sizeof(signature_size) + signature.size();
 	// Only binaries a pipeline uses: one captured or copied again leaves its earlier ones unused.
-	std::vector<uint32_t> renumbered(m_binaries.size(), UINT32_MAX);
+	std::vector<uint8_t>  listed(m_binaries.size(), 0);
 	std::vector<uint32_t> used;
 	for (const auto& [key, list]: m_pipelines) {
 		for (const auto ref: list) {
-			if (renumbered[ref] != UINT32_MAX) continue;
-			renumbered[ref] = static_cast<uint32_t>(used.size());
+			if (listed[ref] != 0) continue;
+			listed[ref] = 1;
 			used.push_back(ref);
 		}
 	}
-	Put(tables, static_cast<uint32_t>(used.size()));
-	std::vector<uint8_t> copied;
+	// A binary the store holding it cannot give back (its file damaged on the disk: cut short, or other bytes than its
+	// hash) is left out, with every pipeline that uses it, which then compiles when first needed: before, one damaged
+	// shard of a precompile failed its merge every time (issue #225).
+	std::vector<uint32_t> renumbered(m_binaries.size(), UINT32_MAX);
+	std::string           binary_table;
+	uint32_t              written = 0;
+	std::vector<uint8_t>  copied;
 	for (const auto ref: used) {
 		const auto& binary = m_binaries[ref];
 		const auto* data   = &binary.data;
 		if (binary.from != nullptr) {
-			if (!binary.from->ReadData(binary.from->m_binaries[binary.index], copied)) return false;
+			if (!binary.from->ReadData(binary.from->m_binaries[binary.index], copied)) {
+				out.unreadable_binaries++;
+				continue;
+			}
 			data = &copied;
 		}
 		file.write(reinterpret_cast<const char*>(data->data()), static_cast<std::streamsize>(data->size()));
-		PutKey(tables, binary.key);
-		Put(tables, offset);
-		Put(tables, static_cast<uint64_t>(data->size()));
-		Put(tables, static_cast<uint64_t>(XXH3_64bits(data->data(), data->size())));
+		PutKey(binary_table, binary.key);
+		Put(binary_table, offset);
+		Put(binary_table, static_cast<uint64_t>(data->size()));
+		Put(binary_table, static_cast<uint64_t>(XXH3_64bits(data->data(), data->size())));
 		offset += data->size();
+		renumbered[ref] = written++;
 	}
-	Put(tables, static_cast<uint32_t>(m_pipelines.size()));
+	if (!file) {
+		out.failure = "writing it failed after " + std::to_string(offset >> 20u) + " MiB";
+		return false;
+	}
+	std::string tables;
+	Put(tables, written);
+	tables += binary_table;
+	std::string           pipeline_table;
+	uint32_t              kept = 0;
 	std::vector<uint32_t> refs;
 	for (const auto& [key, list]: m_pipelines) {
-		PutKey(tables, key);
-		Put(tables, static_cast<uint32_t>(refs.size()));
-		Put(tables, static_cast<uint32_t>(list.size()));
+		if (std::any_of(list.begin(), list.end(), [&](uint32_t ref) { return renumbered[ref] == UINT32_MAX; })) {
+			out.dropped_pipelines++;
+			continue;
+		}
+		PutKey(pipeline_table, key);
+		Put(pipeline_table, static_cast<uint32_t>(refs.size()));
+		Put(pipeline_table, static_cast<uint32_t>(list.size()));
 		for (const auto ref: list) refs.push_back(renumbered[ref]);
+		kept++;
 	}
+	Put(tables, kept);
+	tables += pipeline_table;
 	Put(tables, static_cast<uint32_t>(refs.size()));
 	for (const auto ref: refs) Put(tables, ref);
 	file.write(tables.data(), static_cast<std::streamsize>(tables.size()));
 	const uint64_t footer[2] {offset, XXH3_64bits(tables.data(), tables.size())};
 	file.write(reinterpret_cast<const char*>(footer), sizeof(footer));
 	file.write(Magic, sizeof(Magic));
-	return static_cast<bool>(file);
+	file.close();
+	if (!file) {
+		out.failure = "writing its tables failed";
+		return false;
+	}
+	return true;
+}
+
+// <n>: <name>.played.<n>.binaries beside <base>, <name>.played.binaries.
+static std::filesystem::path PlayedFile(const std::filesystem::path& base, uint32_t n) {
+	return base.parent_path() /
+	       fmt::format("{}.{}{}", Common::PathToString(base.stem()), n, Common::PathToString(base.extension()));
+}
+
+std::unique_ptr<PlayedPipelines> PlayedPipelines::Open(vk::Device device, const std::filesystem::path& base,
+                                                       const std::string& signature) {
+	if (signature.empty()) return nullptr;
+	std::unique_ptr<PlayedPipelines> played(new PlayedPipelines);
+	played->m_device    = device;
+	played->m_base      = base;
+	played->m_signature = signature;
+	played->m_session   = std::make_unique<PipelineBinaryWriter>(device);
+	struct File {
+		std::filesystem::path path;
+		int64_t               n = -1; // the base
+	};
+	const auto base_name = Common::PathToString(base.filename());
+	const auto prefix    = Common::PathToString(base.stem()) + ".";
+	const auto suffix    = Common::PathToString(base.extension());
+	std::error_code error;
+	const auto      list = [&] {
+		std::vector<File> files;
+		for (const auto& entry: std::filesystem::directory_iterator(base.parent_path(), error)) {
+			const auto name = Common::PathToString(entry.path().filename());
+			if (name.ends_with(".tmp") && name.starts_with(prefix)) {
+				std::filesystem::remove(entry.path(), error); // a save that did not finish
+				continue;
+			}
+			if (name == base_name) {
+				files.push_back({entry.path(), -1});
+				continue;
+			}
+			if (!name.starts_with(prefix) || !name.ends_with(suffix) || name.size() <= prefix.size() + suffix.size()) continue;
+			const auto digits = std::string_view(name).substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+			if (digits.size() > 9 || !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+				continue;
+			}
+			files.push_back({entry.path(), std::stoll(std::string(digits))});
+		}
+		std::sort(files.begin(), files.end(), [](const File& a, const File& b) { return a.n > b.n; });
+		return files;
+	};
+	auto     files = list();
+	uint64_t total = 0;
+	for (const auto& file: files) {
+		if (const auto size = std::filesystem::file_size(file.path, error); !error) total += size;
+	}
+	if (total > Limit) {
+		for (const auto& file: files) std::filesystem::remove(file.path, error);
+		std::printf("Played pipelines: starting over (%llu MiB in %zu files, limit %llu MiB)\n",
+		            static_cast<unsigned long long>(total >> 20u), files.size(), static_cast<unsigned long long>(Limit >> 20u));
+		files.clear();
+	}
+	const auto open = [&] {
+		played->m_stores.clear();
+		size_t removed = 0;
+		for (const auto& file: files) {
+			auto store = PipelineBinaries::Open(device, file.path, signature);
+			if (store == nullptr) {
+				std::filesystem::remove(file.path, error); // another GPU's or driver's, or damaged
+				removed++;
+				continue;
+			}
+			played->m_next = std::max<uint32_t>(played->m_next, static_cast<uint32_t>(file.n + 1));
+			played->m_stores.push_back(std::move(store));
+		}
+		if (removed != 0) std::printf("Played pipelines: %zu files of another GPU or driver removed\n", removed);
+	};
+	open();
+	// Merged oldest first (a pipeline kept again replaces the earlier one) into the base, the others then removed.
+	if (played->m_stores.size() > MergeAt) {
+		PipelineBinaryWriter merged(device);
+		const auto           count = played->m_stores.size();
+		for (auto store = played->m_stores.rbegin(); store != played->m_stores.rend(); ++store) merged.CopyAll(**store);
+		auto temporary = base;
+		temporary += ".tmp";
+		const bool saved = merged.Save(temporary, signature);
+		played->m_stores.clear(); // (closes the files: the base may be replaced)
+		bool done = false;
+		if (saved) {
+			error.clear();
+			std::filesystem::rename(temporary, base, error);
+			done = !error;
+		}
+		if (done) {
+			for (const auto& file: files) {
+				if (file.n >= 0) std::filesystem::remove(file.path, error);
+			}
+		} else {
+			std::filesystem::remove(temporary, error);
+		}
+		std::printf("Played pipelines: %zu files merged into one, %zu pipelines%s\n", count, merged.Pipelines(),
+		            done ? "" : ": FAILED");
+		played->m_next = 0;
+		files          = list();
+		open();
+	}
+	uint64_t bytes = 0;
+	for (const auto& store: played->m_stores) {
+		played->m_held += store->Pipelines();
+		bytes += store->DataBytes();
+	}
+	if (!played->m_stores.empty()) {
+		std::printf("Played pipelines: %zu kept by earlier sessions (%llu MiB in %zu files)\n", played->m_held,
+		            static_cast<unsigned long long>(bytes >> 20u), played->m_stores.size());
+	}
+	std::fflush(stdout);
+	return played;
+}
+
+PlayedPipelines::~PlayedPipelines() = default;
+
+PipelineBinaries::Handles PlayedPipelines::Load(const PipelineBinaries::Key& key) const {
+	for (const auto& store: m_stores) {
+		if (store->Holds(key)) return store->Load(key);
+	}
+	return {};
+}
+
+void PlayedPipelines::Capture(const PipelineBinaries::Key& key, vk::Pipeline pipeline) {
+	std::shared_lock lock(m_session_mutex);
+	const auto       left_out = m_session->LeftOut();
+	if (!m_session->Capture(key, pipeline)) return;
+	if (m_session->LeftOut() != left_out) {
+		if (m_capturing.exchange(false, std::memory_order_relaxed)) {
+			std::printf("Played pipelines: the driver compresses binaries with its dictionary: none kept from here on\n");
+			std::fflush(stdout);
+		}
+		return;
+	}
+	m_captured.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool PlayedPipelines::Save() {
+	std::lock_guard                       save(m_save_mutex);
+	std::unique_ptr<PipelineBinaryWriter> taken;
+	{
+		std::unique_lock lock(m_session_mutex);
+		if (m_session->Pipelines() == 0) return true;
+		taken = std::exchange(m_session, std::make_unique<PipelineBinaryWriter>(m_device));
+	}
+	const auto      path      = PlayedFile(m_base, m_next);
+	auto            temporary = path;
+	std::error_code error;
+	temporary += ".tmp";
+	const bool saved = taken->Save(temporary, m_signature);
+	if (saved) std::filesystem::rename(temporary, path, error);
+	if (!saved || error) {
+		std::filesystem::remove(temporary, error);
+		m_save_failures.fetch_add(1, std::memory_order_relaxed);
+		std::printf("Played pipelines: saving %zu to %s FAILED\n", taken->Pipelines(), Common::PathToString(path).c_str());
+		std::fflush(stdout);
+		return false;
+	}
+	m_next++;
+	m_saved.fetch_add(taken->Pipelines(), std::memory_order_relaxed);
+	std::printf("Played pipelines: %zu kept in %s\n", taken->Pipelines(), Common::PathToString(path).c_str());
+	std::fflush(stdout);
+	return true;
+}
+
+void PlayedPipelines::ReportChanged() {
+	const uint64_t counts = hits.load() + refused.load() + m_captured.load() + m_saved.load() + m_save_failures.load();
+	if (std::exchange(m_reported, counts) != counts) Report();
+}
+
+void PlayedPipelines::Report() const {
+	std::printf("Played pipelines: %llu made of earlier sessions' binaries (%zu held), %llu refused, %llu compiled and kept "
+	            "(%llu saved, %llu save failures)%s\n",
+	            static_cast<unsigned long long>(hits.load()), m_held, static_cast<unsigned long long>(refused.load()),
+	            static_cast<unsigned long long>(m_captured.load()), static_cast<unsigned long long>(m_saved.load()),
+	            static_cast<unsigned long long>(m_save_failures.load()), Capturing() ? "" : " (capture off: dictionary)");
+	std::fflush(stdout);
 }
 
 } // namespace Libs::Graphics

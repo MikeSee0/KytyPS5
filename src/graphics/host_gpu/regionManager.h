@@ -6,7 +6,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
-#include "writeback-verify.h"
 
 #include <atomic>
 #include <immintrin.h>
@@ -69,6 +68,7 @@ public:
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
+	[[nodiscard]] bool OwnedByCurrentThread() const noexcept { return m_owner.load(std::memory_order_relaxed) == CurrentThread(); }
 	// A read of state only holders of this lock write, without taking it: valid when no holder
 	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
 	// The query then costs no locked instruction and leaves the lock's line to the writers.
@@ -276,16 +276,6 @@ private:
 		m_readable    = readable;
 		if (mask.None()) {
 			return;
-		}
-		// (Diagnostic, KYTY_WRITEBACK_VERIFY: the pages becoming GPU-owned hashed, the ones given back forgotten.)
-		if (WritebackVerify::Enabled()) {
-			for (const auto [start, end]: mask) {
-				if constexpr (track) {
-					WritebackVerify::Owned(m_cpu_addr + start * TRACKER_PAGE_SIZE, end - start);
-				} else {
-					WritebackVerify::Released(m_cpu_addr + start * TRACKER_PAGE_SIZE, end - start);
-				}
-			}
 		}
 		if constexpr (track) {
 			m_page_manager.UpdatePageWatchersForRegion<true, true>(m_cpu_addr, mask);

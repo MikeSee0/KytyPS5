@@ -4,6 +4,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -11,13 +12,17 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
+#include "file-offload.h"
 #include "local-platform.h"
+#include "scene-tags.h"
 #include "slow-log.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -1298,6 +1303,22 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
+// Demon's Souls loads a map: its .arealoadlist first (/map/m02_00_00_00/m02_00_00_00.arealoadlist). The map is the
+// scene the pipeline warmup makes the recorded pipelines of (local/scene-tags.h).
+static void NoteSceneRead(const std::string& path) {
+	constexpr std::string_view Suffix = ".arealoadlist";
+	constexpr size_t           Name   = 12; // m02_00_00_00
+	if (path.size() < Suffix.size() + Name || !path.ends_with(Suffix)) return;
+	const auto name = std::string_view(path).substr(path.size() - Suffix.size() - Name, Name);
+	if (name[0] != 'm') return;
+	uint32_t id = 0;
+	for (const char c: name.substr(1)) {
+		if (c >= '0' && c <= '9') id = id << 4u | static_cast<uint32_t>(c - '0');
+		else if (c != '_') return;
+	}
+	SceneTags::Enter(id != 0 ? id : 0x80000000u);
+}
+
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset) {
 	if (execution_result == nullptr || error_offset == nullptr) {
@@ -1376,6 +1397,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					return OK;
 				}
 
+				NoteSceneRead(host_path);
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
@@ -1569,10 +1591,20 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		const auto root      = Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0"));
 		const auto id        = title + (version.empty() ? "" : "_" + version);
 		const auto recording = "_PipelineCache/files/" + id + ".files";
-		SeedFileRecording(recording, "tools/local/static-precompile/files-" + id + ".files");
+		// (The EU and Asian editions take the US one's: Libs::Graphics::DemonsSouls::ShippedTitle.)
+		auto            released = "tools/local/static-precompile/files-" + id + ".files";
+		std::error_code error;
+		if (const auto shipped = Libs::Graphics::DemonsSouls::ShippedTitle(title);
+		    shipped != title && !std::filesystem::exists(released, error))
+			released = "tools/local/static-precompile/files-" + std::string(shipped) + id.substr(title.size()) + ".files";
+		SeedFileRecording(recording, released);
 		LocalPlatform::FollowKeptFiles(recording, root);
 	});
 	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
+		const struct Done {
+			const std::string& path;
+			~Done() { LocalPlatform::DoneKeptReadFile(path); }
+		} done {host_path};
 		opening = Clock::now() - start;
 		if (file_offset >= kept_size) {
 			return OK;
@@ -1600,12 +1632,19 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			*bytes_read += read;
 		}
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
+		FileOffload::NoteRead(host_path, destination, *bytes_read, file_offset);
 		return OK;
 	}
 
 	Common::File file;
 	if (!file.Open(Common::PathFromUtf8(host_path), Common::File::Mode::Read)) {
 		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
+		// (In the run log too, the first few: a game whose file reads fail waits on its loading screen, issue #249.)
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("APR: the game's file %s could not be opened\n", host_path.c_str());
+			std::fflush(stdout);
+		}
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
 	opening = Clock::now() - start;
@@ -1645,6 +1684,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	}
 
 	file.Close();
+	FileOffload::NoteRead(host_path, destination, *bytes_read, file_offset);
 	return OK;
 }
 

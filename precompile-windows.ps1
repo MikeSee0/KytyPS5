@@ -28,8 +28,11 @@
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. The shards are small (-Shards, about 100 pipelines each):
 # after a few hundred pipelines NVIDIA compresses binaries with a dictionary of its own, which only that
-# PC reads (pipelineBinaries.h); a shard that got there anyway left the rest out (exit code 3) and runs
-# again as two. recorded-<title>_<version>.seeds next to the seed file (-Recorded) adds the specializations of
+# PC reads (pipelineBinaries.h); a shard stops at 160 (KYTY_PRECOMPILE_SHARD_CAP) or where the dictionary came
+# anyway, leaves the rest (exit code 3) and runs again as two. A dictionary from a shard's first pipeline on was the
+# driver's before the shard compiled anything (issue #107: the game's driver cache, which v20261021's program loaded),
+# which no smaller shard escapes: the run ends.
+# recorded-<title>_<version>.seeds next to the seed file (-Recorded) adds the specializations of
 # recorded play; a PC without a recording of its own (a release) gets those of the specialization hints the release
 # ships (tools\local\static-precompile\hints-<title>_<version>.hints: recordings without the game's code), completed
 # with the code of the seed file into hinted-<title>_<version>.seeds (kyty_shader_precompile --apply-hints, a second).
@@ -56,6 +59,8 @@ param(
 	[int]$Threads = 3,
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
+	# The graphics card to compile for on a PC with more than one: run-windows.ps1's -Gpu (a number or a part of its name).
+	[string]$Gpu = '',
 	[switch]$Coverage,
 	[switch]$Quick,
 	[switch]$Full,
@@ -68,6 +73,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+if ($Gpu) { $env:KYTY_GPU = $Gpu }
 # The AMD driver keys its pipelines (VK_KHR_pipeline_binary keys, its pipeline cache) by the executable's name: what
 # kyty_shader_precompile.exe compiled, kyty_emulator.exe never found (10-16, RX 9070 XT: 0 of every pipeline the game
 # made). The program runs named like the emulator (its DLLs next to it), on any GPU: a hard link in the emulator's
@@ -167,8 +173,12 @@ if ($ExportHints) {
 	foreach ($file in $recordings) { $arguments += @('--recorded', $file.FullName) }
 	& $Exe @arguments
 	if ($LASTEXITCODE) { throw 'making the hints failed (kyty_shader_precompile --make-hints)' }
-	Write-Host "hints: $out ($([math]::Ceiling((Get-Item $out).Length / 1KB)) KiB, no game code in it): attach it to an issue"
-	Start-Process explorer.exe "/select,`"$out`""
+	# Zipped as well: GitHub takes a .zip as an attachment, not a .hints file.
+	$zip = "$out.zip"
+	Remove-Item -LiteralPath $zip -ErrorAction SilentlyContinue
+	Compress-Archive -LiteralPath $out -DestinationPath $zip
+	Write-Host "hints: $zip ($([math]::Ceiling((Get-Item $zip).Length / 1KB)) KiB, no game code in it): attach it to a GitHub issue"
+	Start-Process explorer.exe "/select,`"$zip`""
 	exit 0
 }
 $recordedLost = $false
@@ -217,6 +227,13 @@ if ($Recorded -eq '*') {
 		}
 	}
 }
+# The pipelines a seed file's dry run planned as its own (its plan line), 0 without one.
+function Get-PlannedPipelines([string]$name) {
+	$line = Select-String -LiteralPath "$logs\$name.out.log" -Pattern "of them this seed file's" -SimpleMatch -ErrorAction SilentlyContinue |
+		Select-Object -Last 1
+	if ($line -and $line.Line -match '\((\d+) pipelines, (\d+) of them') { return [int64]$Matches[2] }
+	return 0
+}
 # The pipeline recipes of a seed file (its body after the identity line and checksum: the records, each its word
 # count and words, then the recipes' count).
 function Get-SeedPipelines([string]$file) {
@@ -253,6 +270,19 @@ $begin = Get-Date
 
 # Each process gets an empty NVIDIA disk cache of its own (nothing trained yet), removed when it is done.
 $nvidiaCaches = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-$stamp"
+# Windows 11 guesses the quality of service of a process without a window of its own from its priority and its
+# console's visibility, and may run low ones on the efficiency cores only: an i7-12700's 4 E-cores at 100% and its 16
+# P-core threads idle (#63). Each shard is tagged HighQoS (power throttling of its execution speed off), which comes
+# before those guesses; it stays below normal priority, and -Affinity still decides the CPUs.
+Add-Type -Namespace KytyPrecompile -Name Qos -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState state, uint size);
+public static bool High(IntPtr process) {
+	// ProcessPowerThrottling (4), PROCESS_POWER_THROTTLING_CURRENT_VERSION (1), EXECUTION_SPEED (1) controlled and off.
+	var state = new PowerThrottlingState { Version = 1, ControlMask = 1, StateMask = 0 };
+	return SetProcessInformation(process, 4, ref state, (uint)Marshal.SizeOf(state));
+}
+'@
 function Start-Precompile([string]$name, [string[]]$arguments) {
 	$env:__GL_SHADER_DISK_CACHE_PATH = Join-Path $nvidiaCaches $name
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
@@ -260,14 +290,22 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
 	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
 	$process.ProcessorAffinity = [IntPtr]$mask
-	$null = $process.Handle # keeps the exit code readable after the process ends
-	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
+	$null = [KytyPrecompile.Qos]::High($process.Handle) # also keeps the exit code readable after the process ends
+	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH
+	$process | Add-Member NoteProperty Logs @("$logs\$name.err.log", "$logs\$name.out.log") -PassThru
 }
 function Remove-NvidiaCache($process) { Remove-Item -Recurse -Force $process.NvidiaCache -ErrorAction SilentlyContinue }
 function Wait-Precompile($process, [string]$what) {
 	$process.WaitForExit()
 	Remove-NvidiaCache $process
-	if ($process.ExitCode -ne 0) { throw "$what failed; logs: $logName" }
+	if ($process.ExitCode -ne 0) {
+		# The program's own last words first (a graphics card the emulator cannot use says what it lacks, #149).
+		foreach ($file in $process.Logs) {
+			$tail = @(Get-Content $file -Tail 4 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
+			if ($tail.Count) { $tail | ForEach-Object { Write-Host "  $_" }; break }
+		}
+		throw "$what failed; logs: $logName"
+	}
 }
 
 Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask); logs $logName"
@@ -287,6 +325,17 @@ if ($InputsOnly) {
 	Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 	Write-Host "wrote _PipelineCache\static\$gameId.shaders"
 	return
+}
+# The drive the store is made on (issue #225): its last step writes the store as one file of ~5.5 GB beside the shards
+# (~5.5 GB together), which a FAT32 drive cannot hold (4 GB at most per file) - the run failed there after all its work.
+$cacheRoot = [IO.Path]::GetPathRoot((Resolve-Path "$PSScriptRoot\_PipelineCache").Path)
+$cacheDrive = try { New-Object IO.DriveInfo $cacheRoot } catch { $null } # (none for a network share)
+if ($cacheDrive -and $cacheDrive.IsReady) {
+	if ($cacheDrive.DriveFormat -in @('FAT32', 'FAT')) {
+		throw "the drive $cacheRoot is $($cacheDrive.DriveFormat), which holds no file of 4 GB or more, and the shader store is one file of about 5.5 GB: move this folder to an NTFS or exFAT drive"
+	}
+	$freeGb = [math]::Floor($cacheDrive.AvailableFreeSpace / 1GB)
+	if ($freeGb -lt 12) { Write-Host "warning:    $freeGb GB free on $cacheRoot; the run needs about 12 GB at its end (the shards and the store at once)" }
 }
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
@@ -312,17 +361,34 @@ if (!$Quick) {
 }
 $first  = [System.Collections.Generic.Queue[object]]::new()
 $second = [System.Collections.Generic.Queue[object]]::new()
+# About 100 pipelines a shard, as the plan counts them. (The recorded seed file's graphics recipes alone counted half of
+# its pipelines: 1.07's hints made shards of about 240, past where NVIDIA's driver compresses with its dictionary.)
 if ($hasRecorded) {
-	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
-	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
+	$planned = Get-PlannedPipelines 'plan-recorded'
+	if ($planned -le 0) { $planned = 2 * (Get-SeedPipelines $Recorded) }
+	$count = [math]::Max(1, [math]::Ceiling($planned / 100))
 	for ($i = 0; $i -lt $count; $i++) { $first.Enqueue(@($Recorded, "$i/$count")) }
 }
 if (!$Quick) {
-	for ($i = 0; $i -lt $Shards; $i++) { $second.Enqueue(@($Seeds, "$i/$Shards")) }
+	$count = [math]::Max($Shards, [math]::Ceiling((Get-PlannedPipelines 'plan-seeds') / 100))
+	for ($i = 0; $i -lt $count; $i++) { $second.Enqueue(@($Seeds, "$i/$count")) }
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
 $env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
+# Pipelines the graphics driver never finished compiling (a shard's hang guard: exit 4, issue #126), listed here: every
+# shard leaves them out.
+$stuckList = "$logs\stuck-pipelines.txt"
+$env:KYTY_PRECOMPILE_STUCK = $stuckList
+$restarted = 0
+# A shard that used almost no CPU for 20 minutes is hung outside the driver's compiles, which its own guard watches (exit 4
+# after 10): it is ended and started again, twice at most, then left out (the game makes its pipelines where first
+# needed). Issue #213: one shard of the first tier stayed for good at no CPU, and the second tier never started.
+$idleMinutes = 20
+$idleWindow = @{}   # name -> @(CPU seconds, the window's start)
+$idleEnded = @{}    # names ended here: their exit is not a failure
+$idleRestarts = @{} # 'seed file|shard' -> restarts
+$idleChecked = Get-Date
 $running = @{}
 $finished = 0
 $split = 0
@@ -358,7 +424,34 @@ while ($first.Count -or $second.Count -or $running.Count) {
 		if (!$process.HasExited) { continue }
 		$running.Remove($name)
 		Remove-NvidiaCache $process
+		$idleWindow.Remove($name)
+		if ($idleEnded.ContainsKey($name)) {
+			$idleEnded.Remove($name)
+			$key = "$seedFile|$shard"
+			$idleRestarts[$key] = 1 + [int]$idleRestarts[$key]
+			foreach ($stream in 'out', 'err') {
+				Move-Item -LiteralPath "$logs\$name.$stream.log" "$logs\$name.idle$($idleRestarts[$key]).$stream.log" -ErrorAction SilentlyContinue
+			}
+			if ($idleRestarts[$key] -le 2) {
+				$queue = $second
+				if ($seedFile -eq $Recorded) { $queue = $first }
+				$queue.Enqueue(@($seedFile, $shard))
+				Write-Host ("  {0:hh\:mm\:ss} {1}: no work for $idleMinutes minutes; started again" -f ((Get-Date) - $begin), $name)
+			} else {
+				$finished++
+				Write-Host (("  {0:hh\:mm\:ss} {1}: no work for $idleMinutes minutes a third time; left out (the game makes its " +
+					"pipelines when it first needs them)") -f ((Get-Date) - $begin), $name)
+			}
+			continue
+		}
 		if ($process.ExitCode -eq 3) {
+			# NVIDIA's dictionary from the shard's first pipeline on: the driver had it before the shard compiled anything,
+			# and every smaller shard would too (issue #107).
+			if (Select-String -LiteralPath "$logs\$name.out.log" -Pattern 'dictionary from here on (after 0 captured' -SimpleMatch -Quiet) {
+				throw ("$name : NVIDIA's driver compressed even its first pipeline with a dictionary it had before, so the " +
+					"precompile cannot keep its pipelines and smaller shards would not help. Please report it in issue #107 " +
+					"(github.com/chenxiao07/KytyPS5) with the logs in $logName; what the precompile finished is kept.")
+			}
 			$i, $n = [int[]]($shard -split '/')
 			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
 			$queue = $second
@@ -366,10 +459,38 @@ while ($first.Count -or $second.Count -or $running.Count) {
 			$queue.Enqueue(@($seedFile, "$i/$(2 * $n)"))
 			$queue.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
 			$split++
+		} elseif ($process.ExitCode -eq 4) {
+			# A pipeline the driver never finished compiling (named in the shard's log and in stuck-pipelines.txt): the
+			# shard starts again without it, what it made kept (its .part file, merged like the shards').
+			$restarted++
+			if ($restarted -gt 100) { throw "more than 100 shards stopped at pipelines the driver never finished; logs: $logName" }
+			foreach ($stream in 'out', 'err') {
+				Move-Item -LiteralPath "$logs\$name.$stream.log" "$logs\$name.stuck$restarted.$stream.log" -ErrorAction SilentlyContinue
+			}
+			$queue = $second
+			if ($seedFile -eq $Recorded) { $queue = $first }
+			$queue.Enqueue(@($seedFile, $shard))
+			Write-Host ("  {0:hh\:mm\:ss} {1}: the graphics driver never finished compiling a pipeline; started again without it" -f
+				((Get-Date) - $begin), $name)
 		} elseif ($process.ExitCode -ne 0) {
 			throw "$name failed; logs: $logName"
 		} else {
 			$finished++
+		}
+	}
+	if (((Get-Date) - $idleChecked).TotalSeconds -ge 30) {
+		$idleChecked = Get-Date
+		foreach ($name in @($running.Keys)) {
+			$process = $running[$name][2]
+			if ($process.HasExited -or $idleEnded.ContainsKey($name)) { continue }
+			$process.Refresh()
+			$cpu = $process.TotalProcessorTime.TotalSeconds
+			if (!$idleWindow.ContainsKey($name)) { $idleWindow[$name] = @($cpu, (Get-Date)); continue }
+			$cpuThen, $since = $idleWindow[$name]
+			if ($cpu - $cpuThen -ge 5) { $idleWindow[$name] = @($cpu, (Get-Date)); continue }
+			if (((Get-Date) - $since).TotalMinutes -lt $idleMinutes) { continue }
+			$idleEnded[$name] = $true
+			Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
 		}
 	}
 	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
@@ -379,6 +500,7 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
+$env:KYTY_PRECOMPILE_STUCK = $null
 # (-Quick: what the store held of the other shaders stays. Recorded play that could not be gathered: the pipelines an
 # earlier run made for it stay too - pruned to the seeds alone, the game compiled them all again while playing.)
 # (--stamp: the store's translation features, those this run used: ShaderRecompiler TranslatorFeatures.)
@@ -390,6 +512,12 @@ $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSSc
 	"$PSScriptRoot\_PipelineCache\static\$gameId.blobs" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
+if (Test-Path -LiteralPath $stuckList) {
+	$stuckCount = @(Get-Content -LiteralPath $stuckList).Count
+	Write-Host ("$stuckCount pipeline(s) left out: the graphics driver never finished compiling them " +
+		"($logName\stuck-pipelines.txt). The game compiles them when it first needs them and may stop there the same way: " +
+		"please report it on GitHub with that file.")
+}
 } finally {
 	# A failed shard ends the run: the others are stopped too.
 	if ($running) { foreach ($entry in $running.Values) { if (!$entry[2].HasExited) { $entry[2].Kill(); $entry[2].WaitForExit() } } }

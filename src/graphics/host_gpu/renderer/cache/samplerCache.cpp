@@ -5,7 +5,19 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 namespace Libs::Graphics {
+
+namespace {
+std::atomic<float> g_upscale_lod_bias {0.0f};
+} // namespace
+
+void SetUpscaleLodBias(float bias) {
+	g_upscale_lod_bias.store(bias, std::memory_order_relaxed);
+}
 
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
@@ -14,8 +26,19 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
+bool UpscaleBiasApplies(bool pixel, uint32_t color_targets) {
+	static const uint32_t least = [] {
+		const char* value = std::getenv("KYTY_UPSCALE_LOD_BIAS_TARGETS");
+		return value != nullptr && *value != 0 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 3u;
+	}();
+	return pixel && (color_targets == 0 || color_targets >= least);
+}
+
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool material) {
+	// (A material's sampler is one of its own only while the upscaler's bias is on: else it would be the same one.)
+	const auto biased = static_cast<uint32_t>(material) *
+	                    static_cast<uint32_t>(g_upscale_lod_bias.load(std::memory_order_relaxed) != 0.0f);
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], biased};
 	// Samplers live as long as the cache: a thread's recent lookups need neither the lock nor
 	// the map.
 	struct Recent {
@@ -106,23 +129,27 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	// Float border colors: the game samples UNORM, float and depth formats, for which Vulkan leaves an INT border color
+	// undefined (read as its bits as a float, opaque white is ~0). A shadow map's compare sampler clamped to an opaque white
+	// border (lit outside the map) then read as in shadow, and past sunShadowMaxDistance, which the Low and Lowest presets
+	// shorten, surfaces went dark. Transparent black is zero either way; integer formats would want INT colors.
+	vk::BorderColor border = vk::BorderColor::eFloatTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = vk::BorderColor::eFloatTransparentBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border = vk::BorderColor::eFloatOpaqueBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border = vk::BorderColor::eFloatOpaqueWhite;
 			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = vk::BorderColor::eFloatTransparentBlack;
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
@@ -138,6 +165,19 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
 	sampler_info.mipLodBias =
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+	// The upscaler's texture LOD bias (SetUpscaleLodBias; issue #224): textures read at the output's resolution, not the
+	// 3D's. Only the materials' samplers (`material`, UpscaleBiasApplies), anisotropic and mipmapped: the frame's other
+	// passes read their images and lighting at levels they pick themselves, which a sampler's bias moves too.
+	if (const float bias = g_upscale_lod_bias.load(std::memory_order_relaxed) * static_cast<float>(biased);
+	    bias != 0.0f && aniso && static_cast<Prospero::SamplerMipFilter>(mip_filter) != Prospero::SamplerMipFilter::kNone &&
+	    !r.ForceUnormCoords()) {
+		sampler_info.mipLodBias += bias;
+		if (static bool noted = false; !noted) {
+			noted = true;
+			std::printf("Samplers: the materials' (anisotropic) read with the upscaler's texture LOD bias %.2f\n", bias);
+			std::fflush(stdout);
+		}
+	}
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
@@ -158,6 +198,18 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
+	}
+	// (In the log: the first sampler of each opaque border color that samples its border.)
+	if (static bool noted[2] {}; border != vk::BorderColor::eFloatTransparentBlack) {
+		const bool white   = border == vk::BorderColor::eFloatOpaqueWhite;
+		const auto borders = [](vk::SamplerAddressMode mode) { return mode == vk::SamplerAddressMode::eClampToBorder; };
+		if (!noted[white ? 1 : 0] && (borders(sampler_info.addressModeU) || borders(sampler_info.addressModeV) ||
+		                              borders(sampler_info.addressModeW))) {
+			noted[white ? 1 : 0] = true;
+			std::printf("Samplers: the first with an opaque %s border (clamp %u/%u/%u, depth compare %u)\n", white ? "white" : "black",
+			            static_cast<unsigned>(r.ClampX()), static_cast<unsigned>(r.ClampY()), static_cast<unsigned>(r.ClampZ()),
+			            static_cast<unsigned>(r.DepthCompareFunc()));
+		}
 	}
 
 	vk::Sampler vk_sampler = nullptr;

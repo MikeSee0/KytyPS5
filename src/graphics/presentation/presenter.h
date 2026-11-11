@@ -49,14 +49,17 @@ public:
 	[[nodiscard]] bool           IsHdrSupported() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
-	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs
-	// are capped (the game's 3D view): movies and menus keep a flip per vblank.
+	// KYTY_FLIP_RATE caps the frame's flip: frames of the game's 3D view only (IsSceneFrame; with frame generation, the
+	// frames carrying its inputs), movies and menus keep a flip per vblank.
 	[[nodiscard]] static bool FlipRateApplies(const Frame& frame) noexcept;
 	// The frame shows the game's 3D view (its TAA pass ran): above 60 Hz the others (movies, menus, loading screens)
 	// keep 60 (videoOut.cpp).
 	[[nodiscard]] static bool IsSceneFrame(const Frame& frame) noexcept;
 	// Frame generation is on: it paces the frames it makes from the intervals between the game's (videoOut.cpp).
 	[[nodiscard]] static bool GeneratesFrames() noexcept;
+	// The swapchain made again before the next present (the window went in or out of full screen: FSR's frame generation
+	// swapchain reports nothing when the size stays the same, issue #174).
+	void                         RequestSwapchainRecreate() noexcept;
 	void                         Discard(Frame& frame);
 
 private:

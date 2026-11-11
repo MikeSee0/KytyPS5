@@ -178,6 +178,8 @@ struct AudioOut2ContextState {
 	uint32_t               queued      = 0;
 	uint32_t               num_grains  = 512;
 	uint64_t               last_update = 0;
+	uint32_t               last_update_sixths = 0; // past last_update, in sixths of a us (a grain: num_grains * 125)
+	uint64_t               drained_at  = 0; // (KYTY_AUDIO_LOG) the device time its queue ran out, until the next push
 };
 
 struct AudioOut2PortStateEntry {
@@ -193,6 +195,7 @@ struct AudioOut2PortStateEntry {
 	const void*            pcm_data      = nullptr;
 	float                  gain          = 1.0f; // a mono (object) port's gain attribute
 	uint32_t               ambisonics    = 0;    // an object port's attribute 8: 0x40 | ACN when it carries one
+	uint32_t               passthrough   = 0;    // an object port's attribute 5: straight to the left (1) or right (2) channel
 	// Attribute 1 as the guest sends it: one gain for each of the port's channels. Its speaker and
 	// vibration ports carry their level here, and a vibration port's is two channels wide - the old
 	// single-float read dropped both.
@@ -238,6 +241,7 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH = 5;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
 static constexpr uint32_t AUDIO_OUT2_AMBISONICS_CHANNEL           = 0x40;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
@@ -321,32 +325,88 @@ static bool audioout2_port_type_is_object(uint16_t port_type) {
 	return (port_type & 0xff00u) == 0x0100u;
 }
 
+// (Diagnostic, KYTY_AUDIO_LOG.) The pushes by mode, and the device time the game missed with the queue drained (its
+// push came late): counted, summed and the longest, printed with the object grains every 2000 pushes.
+static std::atomic<uint64_t> g_audioout2_pushes_blocking {0}, g_audioout2_pushes_async {0}, g_audioout2_pushes_device {0};
+static std::atomic<uint64_t> g_audioout2_late_count {0}, g_audioout2_late_us {0}, g_audioout2_late_max_us {0};
+
 static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 	if (state == nullptr) {
 		return;
 	}
 
+	// KYTY_AUDIO_CATCHUP_MS (a test, default 0: the time dropped as before): with the queue drained, the device time a
+	// late game missed stays owed for up to that long, and its next pushes are taken at once until it caught up. (The
+	// suspicion it tests: dropped time leaves the host device's queue that much less sound after each late push, and
+	// dropouts with a neural rendering add-on's frame spikes.) A context unpushed for longer starts again from now.
+	static const uint64_t catchup_us = [] {
+		const char* value = std::getenv("KYTY_AUDIO_CATCHUP_MS");
+		return static_cast<uint64_t>(value != nullptr ? std::clamp(std::atoi(value), 0, 1000) : 0) * 1000u;
+	}();
+	// A grain lasts num_grains / 48000 s = num_grains * 125/6 us: counted in sixths of a microsecond, as the device
+	// plays it. (In whole microseconds, 5333 for 256 samples' 5333.33, the game handed over 62.5 grains a million too
+	// many: the device queue, and with it the sound's delay, grew by about 0.2 s an hour of play.)
+	const uint64_t grain_sixths = static_cast<uint64_t>(state->num_grains == 0 ? 512u : state->num_grains) * 125u;
+	// With the queue drained: the device time since last_update the game missed is dropped beyond catchup_us
+	// (last_update = now), as before with catchup_us 0.
+	const auto drained_queue = [&](uint64_t now) {
+		if (now - state->last_update > catchup_us) {
+			state->last_update        = now;
+			state->last_update_sixths = 0;
+		}
+	};
+
 	const auto now = LibKernel::KernelGetProcessTime();
-	if (state->last_update == 0 || state->queued == 0) {
-		state->last_update = now;
+	if (state->last_update == 0 || now < state->last_update) {
+		state->last_update        = now;
+		state->last_update_sixths = 0;
+		return;
+	}
+	if (state->queued == 0) {
+		drained_queue(now);
 		return;
 	}
 
-	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
-	if (now <= state->last_update || grain_micros == 0) {
+	const auto elapsed_sixths = (now - state->last_update) * 6u;
+	if (elapsed_sixths <= state->last_update_sixths) {
 		return;
 	}
-
-	const auto elapsed = now - state->last_update;
-	const auto drained = std::min<uint64_t>(state->queued, elapsed / grain_micros);
+	const auto drained = std::min<uint64_t>(state->queued, (elapsed_sixths - state->last_update_sixths) / grain_sixths);
 	if (drained == 0) {
 		return;
 	}
 
 	state->queued -= static_cast<uint32_t>(drained);
-	state->last_update += drained * grain_micros;
+	const auto advanced       = state->last_update_sixths + drained * grain_sixths;
+	state->last_update       += advanced / 6u;
+	state->last_update_sixths = static_cast<uint32_t>(advanced % 6u);
 	if (state->queued == 0) {
-		state->last_update = now;
+		if (state->drained_at == 0) {
+			state->drained_at = state->last_update;
+		}
+		drained_queue(now);
+	}
+}
+
+// (KYTY_AUDIO_LOG.) A push into a drained queue: how long after the device ran out it came (more than a grain: late).
+static void audioout2_note_push_locked(AudioOut2ContextState* state, uint64_t now) {
+	if (state->queued != 0 || state->drained_at == 0) {
+		return;
+	}
+	const auto late = now > state->drained_at ? now - state->drained_at : 0;
+	state->drained_at = 0;
+	if (late < audioout2_grain_micros(state->num_grains)) {
+		return;
+	}
+	g_audioout2_late_count.fetch_add(1, std::memory_order_relaxed);
+	g_audioout2_late_us.fetch_add(late, std::memory_order_relaxed);
+	if (late > g_audioout2_late_max_us.load(std::memory_order_relaxed)) {
+		g_audioout2_late_max_us.store(late, std::memory_order_relaxed);
+	}
+	static uint32_t count = 0;
+	if (++count <= 40 || count % 100 == 0) {
+		std::printf("AudioOut2: the game's push came %.1f ms after its queue ran out (#%u)\n",
+		            static_cast<double>(late) / 1000.0, count);
 	}
 }
 
@@ -377,10 +437,12 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 // positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
 // plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
 // a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
-// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
-// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
-// the front left and right of the context's first float main port. Adding the 36 channels up instead
-// cancelled most directions.
+// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. A passthrough
+// object goes to its own channel: with headphones the game gives the system its stereo mix on two of
+// them, left and right (attribute 5; its Headphone_3D_PassThru preset), and both played in the centre
+// made the music mono (issue #294). Another object that is no ambisonics channel plays in the centre. Each
+// port's gain applies, and the result goes to the front left and right of the context's first float main
+// port. Adding the 36 channels up instead cancelled most directions.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
 	constexpr float HALF_POWER = 0.70710677f;
 	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
@@ -398,7 +460,10 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 			continue;
 		}
 		float left = HALF_POWER, right = HALF_POWER;
-		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
+		if (object.passthrough == 1 || object.passthrough == 2) {
+			left  = object.passthrough == 1 ? 1.0f : 0.0f;
+			right = object.passthrough == 2 ? 1.0f : 0.0f;
+		} else if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
 			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
 			if (acn == 0) {
 				left = right = W_GAIN;
@@ -441,6 +506,15 @@ static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
 	if (log && ++pushes % 2000 == 0) {
 		std::printf("AudioOut2: %llu pushes, object grains fed %llu, left out %llu\n", static_cast<unsigned long long>(pushes),
 		            static_cast<unsigned long long>(fed), static_cast<unsigned long long>(unfed));
+		std::printf("AudioOut2: at %.1f s: pushes blocking %llu (device-paced %llu), async %llu; late pushes %llu, "
+		            "%.1f ms missed in all, the longest %.1f ms\n",
+		            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
+		            static_cast<unsigned long long>(g_audioout2_pushes_blocking.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_audioout2_pushes_device.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_audioout2_pushes_async.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_audioout2_late_count.load(std::memory_order_relaxed)),
+		            static_cast<double>(g_audioout2_late_us.load(std::memory_order_relaxed)) / 1000.0,
+		            static_cast<double>(g_audioout2_late_max_us.load(std::memory_order_relaxed)) / 1000.0);
 	}
 	for (auto& state: g_audioout2_ports) {
 		if (!state.used || state.context != ctx || state.pcm_data == nullptr) continue;
@@ -655,6 +729,13 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
 	uint32_t sleep_micros = audioout2_grain_micros(512);
+	static const bool log = std::getenv("KYTY_AUDIO_LOG") != nullptr;
+	if (log) {
+		(blocking != 0 ? g_audioout2_pushes_blocking : g_audioout2_pushes_async).fetch_add(1, std::memory_order_relaxed);
+		if (blocking != 0 && audioout2_context_has_queueable_device(ctx)) {
+			g_audioout2_pushes_device.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 
 	for (;;) {
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
@@ -668,8 +749,10 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
 			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = LibKernel::KernelGetProcessTime();
+				// (With the queue drained, audioout2_update_context_locked just set last_update: now, or the owed time
+				// of a late game, KYTY_AUDIO_CATCHUP_MS.)
+				if (log) {
+					audioout2_note_push_locked(state, LibKernel::KernelGetProcessTime());
 				}
 				if (state->queued < state->queue_depth) {
 					state->queued++;
@@ -821,6 +904,8 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	bool        has_gains      = false;
 	uint32_t    ambisonics     = 0;
 	bool        has_ambisonics = false;
+	uint32_t    passthrough    = 0;
+	bool        has_passthrough = false;
 	for (uint32_t i = 0; i < num; i++) {
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
@@ -854,9 +939,14 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			std::memcpy(&ambisonics, attributes[i].value, sizeof(uint32_t));
 			has_ambisonics = true;
 		}
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH && attributes[i].value != nullptr &&
+		    attributes[i].value_size == sizeof(uint32_t)) {
+			std::memcpy(&passthrough, attributes[i].value, sizeof(uint32_t));
+			has_passthrough = true;
+		}
 	}
 
-	if (has_pcm || has_gain || has_gains || has_ambisonics) {
+	if (has_pcm || has_gain || has_gains || has_ambisonics || has_passthrough) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 			if (has_pcm) {
@@ -869,6 +959,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				state->gains_set = true;
 			}
 			if (has_ambisonics) state->ambisonics = ambisonics;
+			if (has_passthrough) state->passthrough = passthrough;
 		}
 		g_audioout2_port_mutex.Unlock();
 	}
@@ -882,7 +973,7 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 
 	std::memset(state, 0, sizeof(AudioOut2PortState));
-	state->output          = 1;
+	state->output          = AudioInternal::MainOutputReported().connection;
 	state->num_channels    = 2;
 	state->volume          = 127;
 	state->reroute_counter = 0;
@@ -1057,7 +1148,7 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
-	info->type             = 0;
+	info->type             = AudioInternal::MainOutputReported().speaker_type;
 	info->available_bits   = 0x03;
 	info->flags            = 0;
 	info->speaker_angle[0] = {-30, 0};

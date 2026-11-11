@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelects.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -110,11 +111,14 @@ void DumpShaderIr(const CompileOptions& options, const IR::Program& ir) {
 	for (size_t i = 0; i < ir.info.images.size(); ++i) {
 		const auto& image = ir.info.images[i];
 		text += fmt::format("image[{}] source={} class={} numeric={} dim={} mips={} read={} written={} "
-		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x}\n",
+		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x} max_layer={}\n",
 		                    i, image.source, static_cast<int>(image.resource_class),
 		                    static_cast<int>(image.numeric_class), static_cast<int>(image.dimension),
 		                    image.mip_count, image.read, image.written, image.atomic,
-		                    image.depth_compare, image.cube, image.first_use_pc);
+		                    image.depth_compare, image.cube, image.first_use_pc,
+		                    image.max_array_index == IR::ImageResource::NoArrayIndexBound
+		                        ? std::string("-")
+		                        : std::to_string(image.max_array_index));
 	}
 	for (size_t i = 0; i < ir.info.buffers.size(); ++i) {
 		const auto& buffer = ir.info.buffers[i];
@@ -768,13 +772,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
-	if (ir.lane_local && ir.lane_local_uniform_loads &&
-	    std::ranges::any_of(ir.info.buffers, [](const IR::BufferResource& buffer) {
-		    return (buffer.packed_stride & IR::BufferAddTidBit) != 0u;
-	    }))
-		ir.lane_local = false;
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	if ((Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureExecSelects) != 0) {
+		const auto selects = IR::EliminateExecSelects(ir.blocks);
+		if (selects.bypassed != 0 || selects.dropped != 0) {
+			LOGF("%s exec selects: bypassed=%" PRIu32 " dropped=%" PRIu32 "\n", GetDumpLabel(options), selects.bypassed,
+			     selects.dropped);
+			IR::EliminateDeadCode(ir.blocks);
+		}
+	}
 
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
@@ -792,7 +799,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	if (options.table_mode) IR::EnterTableMode(ir);
+	if (options.table_mode) {
+		IR::EnterTableMode(ir);
+		ir.table_slots_at_use = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0;
+	}
+	ir.native_float_min_max =
+	    (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureNativeFloatMinMax) != 0;
+	ir.bda_group_walks = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureBdaGroupWalks) != 0;
+	ir.pixel_quad_reads = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePixelQuadReads) != 0;
+	ir.unfused_mad = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureUnfusedMad) != 0;
+	ir.amd_barycentrics = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureAmdBarycentrics) != 0;
 	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
 	DumpShaderIr(options, ir);
 	Spirv::AnalyzeProgramRequirements(ir);

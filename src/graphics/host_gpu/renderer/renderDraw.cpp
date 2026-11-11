@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -35,9 +36,11 @@
 #include "libs/errno.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-switch.h"
 #include "device-fault.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
+#include "frame-gen-hudless.h"
 #include "native-preparation-state.h"
 #include "slow-log.h"
 #include "xpr-capture.h"
@@ -70,10 +73,12 @@ namespace Libs::Graphics {
 extern "C" {
 // 0: a draw run reads no buffer range that any image overlaps; 1: sampled
 // images whose contents still come from the CPU may overlap its read ranges.
-volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode {0};
+volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode {1};
 // KYTY_DRAW_PACKETS: the ordinary DrawIndex/DrawAuto draws are recorded as packets too (their
 // debug phases are CPU-side notes only), instead of ~20 separately recorded Vulkan calls each.
-volatile std::atomic_uint32_t kyty_local_draw_packets_mode {0};
+volatile std::atomic_uint32_t kyty_local_draw_packets_mode {1};
+// KYTY_DRAW_READ_AFTER_WRITE (image.cpp): table draws transit a set with an image they read and write every time.
+extern volatile std::atomic_uint32_t kyty_local_draw_read_after_write;
 }
 
 // Draw state in reusable preparation storage when that switch is on.
@@ -602,7 +607,8 @@ namespace LocalDrawRecording {
 static void Replay(std::span<const LocalVulkanRecording::Segment> segments,
                    const vk::detail::DispatchLoaderDynamic& dispatch) {
     const auto& draw = *static_cast<const Draw*>(segments[0].data);
-    const auto command = draw.command;
+    // (A speculation worker's draw names the placeholder: its spliced replay resolves it to the target.)
+    const vk::CommandBuffer command {LocalVulkanRecording::Resolve(static_cast<VkCommandBuffer>(draw.command))};
     const auto vertex_count = static_cast<uint32_t>(segments[1].size / sizeof(vk::Buffer));
     if (vertex_count)
         command.bindVertexBuffers(0, vertex_count,
@@ -724,7 +730,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			target.image_id = cache.FindImage(target.desc);
+			// (Asked again as at first: the lookup moved the view into the image it found then, a larger one.)
+			target.desc.view_info.base_level = target.guest_mip_level;
+			target.desc.view_info.base_layer = target.guest_array_layer;
+			target.image_id                  = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
@@ -1566,10 +1575,16 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	// KYTY_FG_HUDLESS: a draw into the flip image (the game's final composite) is recorded directly, drawn once more
+	// without its HUD first (frame-gen-hudless.h). Not in a speculative translation, whose work is recorded apart: the
+	// draw is then drawn as it is.
+	const bool hudless   = FrameGen::HudlessCapturing() && Spec::Current() == nullptr && !mesh_active &&
+	                       bindings.pixel.has_value();
+	const int  flip_slot = hudless ? FrameGen::FlipSlot(std::span {state.color_info, state.color_count}) : -1;
 	bool record_draw = false;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	const auto primitive = ucfg.GetPrimType();
-	record_draw = LocalVulkanRecording::PacketsEnabled() && !mesh_active && emit.gpu_args == 0 &&
+	record_draw = flip_slot < 0 && LocalVulkanRecording::PacketsEnabled() && !mesh_active && emit.gpu_args == 0 &&
 	    ((!set_bind_debug && !set_auto_debug) ||
 	     kyty_local_draw_packets_mode.load(std::memory_order_relaxed) != 0) &&
 	    (primitive == Prospero::PrimitiveType::kPointList ||
@@ -1635,11 +1650,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
-	if (!record_draw) {
-		if (set_auto_debug) {
-			SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
-		}
+	const auto emit_draw = [&] {
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (emit.gpu_args != 0 && emit.indexed) {
@@ -1656,6 +1667,17 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 		}
+	};
+	if (flip_slot >= 0) {
+		FrameGen::BeforeFlipDraw(buffer, rendering, state, static_cast<uint32_t>(flip_slot), bindings.pixel->images,
+		                         emit_draw);
+	}
+	m_context.GetCommandScheduler().BeginRendering(rendering);
+	if (!record_draw) {
+		if (set_auto_debug) {
+			SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+		}
+		emit_draw();
 	}
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	else {
@@ -1701,12 +1723,14 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// may end rendering or restart the scheduler.
 	if (m_native_xpr_verify.record != nullptr)
 		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
-	// (A table draw of vertices too: TableStore stores what a table try asked for.)
+	// (A table draw of vertices too: TableStore stores what a table try asked for. The composite drawn without its HUD
+	// first is stored by neither.)
 	if (m_table_xpr)
-		TableStore(buffer, state, topology, primitive_restart_enable, rendering, !mesh_active && vertex_bindings.count == 0);
+		TableStore(buffer, state, topology, primitive_restart_enable, rendering,
+		           flip_slot < 0 && !mesh_active && vertex_bindings.count == 0);
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
-		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)
+		if (flip_slot < 0 && !mesh_active && emit.indexed && vertex_bindings.count == 0)
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering,
 			               std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 		else

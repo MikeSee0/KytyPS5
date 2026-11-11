@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
@@ -22,6 +23,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -34,6 +36,7 @@ struct LocalDescriptorPlan;
 #endif
 class CommandBuffer;
 class PipelineBinaries;
+class PlayedPipelines;
 class PipelineCacheBlobs;
 
 namespace HW {
@@ -164,13 +167,18 @@ public:
 		// wave64 programs natively (AMD RDNA3) gets.
 		uint32_t              host_subgroup_size = 0;
 	};
-	// left_out: pipelines whose binaries were left out (PipelineBinaryWriter), for a smaller shard.
+	// left_out: pipelines whose binaries were left out (PipelineBinaryWriter) and work items a shard left at its capture
+	// cap (KYTY_PRECOMPILE_SHARD_CAP), for a smaller shard.
 	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options, size_t& left_out);
 	// The shader prefetch's inputs (--static-inputs) are this GPU's and driver's, newer than the seeds;
 	// the static pipeline cache is this GPU's and driver's and, unless seeds is empty, newer than the seeds too (a
 	// newer precompile program lists more and makes the seeds again: what is new is compiled then).
 	static bool StaticInputsCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
 	static bool StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
+	// The static store was made without a translation feature this precompile translates with that changes nearly every
+	// shader (ShaderRecompiler::Frontend::TranslatorFeaturesBroad): the next precompile compiles it all again, not only
+	// what is new (issue #246: "only what is new" took an hour).
+	static bool StaticCacheRedoesAll();
 	// The caches the shards of a precompile saved next to the static cache, merged into it. With
 	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
 	// older runs left that no seed makes any more is dropped).
@@ -199,6 +207,10 @@ public:
 		// to make it again (a pipeline the static store gave: made again from it; null: never evicted).
 		mutable uint32_t                                       last_flip = 0;
 		std::shared_ptr<const std::function<void(Pipeline&)>> remake;
+		// Its warmup recipe (LocalShaderWarmup::RecipeKey; 0: none, a native variant), and the scene generation it was
+		// last bound in (local/scene-tags.h: noted once per scene).
+		uint64_t         recipe      = 0;
+		mutable uint64_t scene_noted = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Immutable encoding plan; queued packets keep their own shared ownership.
 		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;
@@ -256,6 +268,10 @@ public:
 	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
 	// (its empty program is no refusal: asked again, it is there).
 	[[nodiscard]] bool TablePending() const;
+	// Two table programs of one source (KYTY_TABLE_LEARN_PORTABLE): the buffers whose specializations differ only in
+	// the V#'s format / swizzle (bits by buffer); UINT32_MAX when anything else differs or either is not a table
+	// permutation here.
+	[[nodiscard]] uint32_t TableFormatOnlyBuffers(const void* want, const void* got) const;
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
@@ -297,6 +313,14 @@ public:
 	// Stops a warmup still running beside the game, and waits for it (the window's close; not under m_mutex).
 	void StopWarmup();
 	[[nodiscard]] PrefetchProgress GetPrefetchProgress() const;
+	// Pipelines compiled where first needed, not made of the static store's binaries: how many and how long, since the
+	// start (the panel's note while it happens, issue #129). Any thread.
+	struct PlayCompiles {
+		uint64_t count = 0, us = 0;
+	};
+	[[nodiscard]] PlayCompiles GetPlayCompiles() const {
+		return {m_play_compiles.load(std::memory_order_relaxed), m_play_compile_us.load(std::memory_order_relaxed)};
+	}
 
 private:
 	struct ProgramCache;
@@ -378,6 +402,8 @@ private:
 	// Or its binaries (pipelineBinaries.h): GraphicContext::pipeline_binaries while open.
 	std::unique_ptr<PipelineBinaries> m_static_binaries;
 	std::unique_ptr<PipelineCacheBlobs> m_static_blobs;
+	// Pipelines compiled in play kept as their binaries beside the driver cache: GraphicContext::played_pipelines.
+	std::unique_ptr<PlayedPipelines> m_played;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
 	// The size of the driver cache's data when it was loaded or last saved (Save skips an unchanged one).
@@ -389,7 +415,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline*, NativeGraphicsPipelineKeyHash>
 	    m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	mutable Common::Mutex m_mutex; // (mutable: TableFormatOnlyBuffers, const, walks the programs under it)
 	// TryCreateGraphicsPipeline: pipelines a worker is still compiling, by key.
 	struct PendingGraphicsPipeline;
 	class CompileWorkers;
@@ -447,23 +473,56 @@ private:
 	void              StartShaderPrefetch(std::vector<std::vector<uint32_t>> recorded_inputs);
 	std::thread       m_warmup_thread;
 	std::atomic<bool> m_warmup_stop {false};
+	// The warmup by scene (local/scene-tags.h, KYTY_SCENE_WARMUP): the recording's file (its .scenes beside it), whether
+	// it is on, and what it made. WarmScene: the pipelines of `scene` (every recorded one for a scene not known yet), from
+	// the warmup's own records (`in_memory`, the first scene) or the recording read again; SceneLoop: those of each scene
+	// the game loads later, until m_warmup_stop.
+	std::filesystem::path        m_warmup_path;
+	bool                         m_scene_warmup     = false;
+	bool                         m_scene_warmed_all = false;
+	std::unordered_set<uint32_t> m_scenes_warmed;
+	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory);
+	void                         SceneLoop(uint64_t compute_video);
 	// Pipelines made where first needed (CreateGraphicsPipeline, CreateComputePipeline), and the time it took.
 	uint64_t m_render_pipelines   = 0;
 	double   m_render_pipeline_ms = 0.0;
+	// Those of them compiled, not made of the static store's binaries (GetPlayCompiles).
+	std::atomic<uint64_t> m_play_compiles {0};
+	std::atomic<uint64_t> m_play_compile_us {0};
+	void                  NotePlayCompile(bool from_store, std::chrono::steady_clock::time_point begin) {
+		 if (from_store) return;
+		 m_play_compiles.fetch_add(1, std::memory_order_relaxed);
+		 m_play_compile_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                                       std::chrono::steady_clock::now() - begin)
+		                                                       .count()),
+		                             std::memory_order_relaxed);
+	}
 	CompileWorkers& Workers();
 	CompileWorkers& TableWorkers();
 	CompileWorkers& OptimizeWorkers();
 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
 	void            PromoteOptimized();
 	// At each flip: with the video memory in use near the GPU's budget, the pipelines no binding used for a while leave
-	// it (their handles destroyed; BindPipelineHandle makes one again from the static store when it is bound).
+	// it (their handles destroyed; BindPipelineHandle makes one again from the static store when it is bound); and a
+	// while after the game changed its world (SceneTags), those of the worlds it left.
 	void            EvictIdlePipelines();
 	// (EvictIdlePipelines) A graphics pipeline's inputs, as its remake keeps them.
 	struct GraphicsMakeInputs;
 	std::shared_ptr<const std::function<void(Pipeline&)>> GraphicsRemake(GraphicsMakeInputs inputs);
-	// (EvictIdlePipelines) When each recent flip began (steady clock, by flip % size), and the video memory pressure.
+	// (EvictIdlePipelines) When each recent flip began (steady clock, by flip % size), the video memory pressure, and
+	// whether the pipelines evicted while idle came back too often for more of it.
 	std::array<int64_t, 32768> m_flip_times {};
 	bool                      m_evict_pressure = false;
+	bool                      m_idle_evict_off = false;
+	// (EvictIdlePipelines) A check came due and a speculation was live: tried again at every flip until none is.
+	bool                      m_evict_due = false;
+	// (EvictIdlePipelines) The world the game is in: its SceneTags generation, the flip and time it began (and the flip
+	// the world before it began), and whether the pipelines of the worlds before those two went.
+	uint64_t                              m_scene_generation = 0;
+	uint32_t                              m_scene_flip       = 0;
+	uint32_t                              m_prev_scene_flip  = 0;
+	std::chrono::steady_clock::time_point m_scene_since {};
+	bool                                  m_scene_swept = true;
 	void InitializeDriverCache();
 	vk::PipelineCache LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit, size_t& loaded_size);
 	bool SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& file_path, size_t& saved_size);
@@ -472,7 +531,8 @@ private:
 	void              MainPipelineDone();
 	void InitializeStaticCache(bool create);
 	// The recorded pipelines; compute ones, newest first, while they took less than `compute_video` bytes of video memory.
-	void WarmPipelines(uint64_t compute_video, bool background);
+	// `only`: of these recipes alone (LocalShaderWarmup::RecipeKey), none the cache has.
+	void WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only = nullptr);
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
 	static bool MergeBinaryShards(GraphicContext& graphics, bool prune, bool keep_shards);
@@ -485,6 +545,10 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 // unoptimized (Fast: Pipeline::unoptimized); Optimize compiles the optimized build of a Fast one (its
 // layouts given, `pipeline` null).
 enum class PipelineBuild { Full, Fast, Optimize };
+// The pipelines a precompile left out so far: the driver refused them (shaders.cpp).
+size_t PipelinesRefused();
+// The pipelines the driver refused in play and what took their place, a log line at the end (none if none).
+void ReportRefusedPipelines();
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
@@ -517,10 +581,6 @@ vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline);
 std::span<const char> ZstdPack(const void* data, size_t bytes, int level = 1);
 bool                  ZstdUnpack(std::span<const char> packed, void* out, size_t bytes);
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
-// (KYTY_INLINE_KEY_CHECK) Each module's SPIR-V kept, so that every pipeline key is compared with the key of the same
-// pipeline given its shaders' SPIR-V inline (VK_KHR_maintenance5): what a store keyed by the first needs of the second.
-bool InlineKeyCheck();
-void NoteInlineSpirv(vk::ShaderModule module, const std::vector<uint32_t>& spirv);
 // The descriptor set and pipeline layouts the pipelines share (one pair per binding set, shaders.cpp): destroyed after
 // every pipeline that uses them.
 void DestroySharedLayouts(vk::Device device);

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-counters.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
@@ -7,6 +8,8 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <utility>
 #include <x86intrin.h>
@@ -15,17 +18,16 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "kernel/memory.h"
+#include "loader/demonsSoulsPageFree.h"
 #include "speculation-state.h"
+#include "fresh-memory.h"
+#include "texture-offload.h"
 
 extern "C" {
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {1};
 // 1: watchers removed while memory is released skip the host protection change there
 // (PageManager::SetUnmappingRange); a write fault on a page nothing watches unprotects it.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {0};
-// Live switch (same-process A/B): a write fault in the 16 KiB window right after the one the same thread's last window
-// fault ended in, within 2 ms (a sequential stream of writes), takes the next 64 KiB at once. (1-1 route, 120 cap, A-B-A
-// over 29 points: window faults -13.6%, fps +0.7%, 1% low +3.8%, p99 -4.1%; uploads +9%, on the upload worker.)
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_window_stream_mode {1};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {1};
 }
 
 namespace Libs::Graphics {
@@ -62,23 +64,21 @@ bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
 	constexpr uint64_t window_size  = 4 * TRACKER_PAGE_SIZE;
 	constexpr uint64_t stream_size  = 16 * TRACKER_PAGE_SIZE;
 	const auto         window_begin = fault & ~(window_size - 1);
-	if (kyty_local_window_stream_mode.load(std::memory_order_relaxed) != 0) {
-		// The window after the one this thread's last window fault ended in, within 2 ms (~6.4M TSC ticks at 3.2 GHz):
-		// a stream, whose next 64 KiB goes at once (the next fault in it is the window after that).
-		thread_local uint64_t last_end = 0, last_tsc = 0;
-		const uint64_t        now      = __rdtsc();
-		const bool            stream   = window_begin == last_end && now - last_tsc < 6'400'000;
-		if (stream && TryInvalidateCpuWriteWindow(fault, window_begin, stream_size)) {
-			last_end = window_begin + stream_size;
-			last_tsc = now;
-			return true;
-		}
-		if (!TryInvalidateCpuWriteWindow(fault, window_begin, window_size)) return false;
-		last_end = window_begin + window_size;
+	// The window after the one this thread's last window fault ended in, within 2 ms (~6.4M TSC ticks at 3.2 GHz): a
+	// stream, whose next 64 KiB goes at once (the next fault in it is the window after that). (1-1 route, 120 cap, A-B-A
+	// over 29 points: window faults -13.6%, fps +0.7%, 1% low +3.8%, p99 -4.1%; uploads +9%, on the upload worker.)
+	thread_local uint64_t last_end = 0, last_tsc = 0;
+	const uint64_t        now      = __rdtsc();
+	const bool            stream   = window_begin == last_end && now - last_tsc < 6'400'000;
+	if (stream && TryInvalidateCpuWriteWindow(fault, window_begin, stream_size)) {
+		last_end = window_begin + stream_size;
 		last_tsc = now;
 		return true;
 	}
-	return TryInvalidateCpuWriteWindow(fault, window_begin, window_size);
+	if (!TryInvalidateCpuWriteWindow(fault, window_begin, window_size)) return false;
+	last_end = window_begin + window_size;
+	last_tsc = now;
+	return true;
 }
 
 bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size) {
@@ -116,6 +116,12 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		// A never-written granule's first write (fresh memory): unwatched, done unless another watcher holds the page.
+		if (FreshFirstWrite(fault_vaddr)) {
+			uint64_t first = 0, end = 0;
+			if (!m_page_manager.WatchedSpan(fault_vaddr & ~(TRACKER_PAGE_SIZE - 1), TRACKER_PAGE_SIZE, &first, &end))
+				return true;
+		}
 		// (A write to a watched page of a view a partial unmap is mapping again: unseen while such a view came back
 		// writable.)
 		const bool in_remap = LibKernel::Memory::InRemapWindow(fault_vaddr);
@@ -157,7 +163,16 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	TextureOffload::OnHostAccess(vaddr, size, false, false);
+	FreshOverwrite(vaddr, size); // (a host write follows: its pages are writable, its granules written)
 	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
+bool GpuResourceManager::InvalidateImages(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) return false;
+	TextureOffload::OnHostAccess(vaddr, size, false, true); // (its caller writes all of it: CompareMove)
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -166,6 +181,8 @@ bool GpuResourceManager::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size)
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	TextureOffload::OnHostAccess(vaddr, size, false, true); // (it writes all of it)
+	FreshOverwrite(vaddr, size);
 	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
@@ -187,10 +204,13 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	const auto map = [this, vaddr, size] {
 		m_texture_cache.MapMemory(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Add(vaddr, size);
-		++m_mapping_epoch;
-		if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
+		{
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.Add(vaddr, size);
+			++m_mapping_epoch;
+			if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
+		}
+		FreshWatch(vaddr, size);
 	};
 	if (m_gpu) {
 		// A pending readback writes its backing when it finishes, which a new mapping aliasing
@@ -211,6 +231,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	TextureOffload::OnHostAccess(vaddr, size, true, false);
 	const auto unmap = [this, vaddr, size, releasing] {
 		// Released memory loses its host protection with the mapping: the watchers removed
 		// below need not restore it page run by page run first.
@@ -228,6 +249,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		// Pending upload jobs on the range read its backing (or change its protection): they finish before
 		// it changes owner. Jobs elsewhere keep running.
 		AsyncUpload::DrainRange(vaddr, size);
+		// Guards of pending guest writes on the range (KYTY_WRITE_GUARD) dropped: a lift after the unmap would protect
+		// whatever is mapped there next (its lift job then finds none).
+		WriteGuard::Drop(vaddr, size);
 		// The GPU only works on the caches' own buffers and images, which are freed after the
 		// work in flight completes (deferred operations), so the unmap need not wait for the GPU
 		// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What
@@ -245,6 +269,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 			                                            std::chrono::steady_clock::now() - start)
 			                                            .count()));
 		}
+		FreshUnwatch(vaddr, size, !releasing);
 		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		if (registered) {
@@ -270,6 +295,47 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_ENGINE_FREE_BUFFERS");
+		return value != nullptr && (value[0] == '0' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 1u;
+	}();
+	if (mode == 0 || m_gpu == nullptr || !GuestRange {vaddr, size}.Valid()) return;
+	(void)m_gpu->TrySendCommand([this, vaddr, size] {
+		// (Unmapped meanwhile: UnmapMemory dealt with its buffers.)
+		if (!IsMapped(vaddr, size)) return;
+		const auto start = std::chrono::steady_clock::now();
+		// What went, reported every 30 s it happened (the GPU thread's own counts: all of its time here, a freed block's read
+		// back included when nothing went).
+		static BufferCache::FreeBlockSplits splits;
+		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
+		static auto                         next   = start + std::chrono::seconds(30);
+		const auto lists = splits.lists;
+		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
+		const auto took  = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+		ns += took;
+		max_ns = std::max(max_ns, took);
+		if (freed != 0) {
+			blocks++;
+			bytes += size;
+			let_go += freed;
+		}
+		if ((freed == 0 && splits.lists == lists) || start < next) return;
+		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
+		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
+		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS)\n",
+		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
+		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
+		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6, static_cast<double>(max_ns) / 1e6,
+		            static_cast<unsigned long long>(LiveCounters::Value(LiveCounters::BdaFaultPages)));
+		std::fflush(stdout);
+		blocks = bytes = let_go = ns = max_ns = 0;
+		splits = {};
+		next   = start + std::chrono::seconds(30);
+	});
 }
 
 bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
@@ -362,6 +428,8 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		spec->bda.insert(spec->bda.end(), ranges.begin(), ranges.end());
 		return true;
 	}
+	// (Before the lock: making buffers asks for it.)
+	m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	LiveCounters::Add(LiveCounters::BdaRangeCalls);
@@ -444,6 +512,128 @@ void GpuResourceManager::EndSubmission() {
 void GpuResourceManager::AdvanceFrame() {
 	m_texture_cache.AdvanceFrame();
 	RunCollectors();
+	if (auto* fresh = FreshMemory::Get(); fresh != nullptr && ++m_fresh_report_flip % 3600 == 0) {
+		size_t parts = 0;
+		{
+			std::lock_guard lock(m_fresh_mutex);
+			parts = m_fresh_parts.size();
+		}
+		std::printf("Fresh memory: %llu MiB of uploads were never-written bytes (zeros, not read); %zu parts watched; "
+		            "%llu MiB written at a first write, %llu MiB by other writes\n",
+		            static_cast<unsigned long long>(fresh->zero_upload_bytes.load() >> 20u), parts,
+		            static_cast<unsigned long long>(fresh->faults.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->marked.load() >> 20u));
+		std::fflush(stdout);
+	}
+}
+
+void GpuResourceManager::FreshWatch(uint64_t vaddr, uint64_t size) {
+	auto* fresh = FreshMemory::Get();
+	if (fresh == nullptr || size == 0) return;
+	bool gpu = false, cpu_write = false;
+	if (!LibKernel::Memory::GuestRangeAccess(vaddr, size, &gpu, &cpu_write)) {
+		FreshMemory::MarkGuestRange(vaddr, size);
+		return;
+	}
+	if (!cpu_write) return; // (no guest write here goes unseen)
+	if (!gpu) {
+		FreshMemory::MarkGuestRange(vaddr, size); // (written unwatched)
+		return;
+	}
+	std::lock_guard lock(m_fresh_mutex);
+	uint64_t        run_begin = 0, run_end = 0;
+	const auto      flush     = [&] {
+		if (run_end > run_begin) m_page_manager.UpdatePageWatchers<true>(run_begin, run_end - run_begin);
+		run_begin = run_end = 0;
+	};
+	for (uint64_t done = 0; done < size;) {
+		const uint64_t at      = vaddr + done;
+		const auto     end     = LibKernel::Memory::BackingMappingEnd(at);
+		const auto     piece   = end > at ? std::min(end - at, size - done) : size - done;
+		const auto*    backing = end > at ? LibKernel::Memory::TryGetBackingPointer(at, piece) : nullptr;
+		if (backing == nullptr) {
+			done += piece;
+			continue;
+		}
+		for (uint64_t offset = 0; offset < piece;) {
+			const auto address = reinterpret_cast<uint64_t>(backing) + offset;
+			const auto granule = FreshMemory::GranuleOf(*fresh, address);
+			const auto bytes   = granule == UINT64_MAX
+			                         ? piece - offset
+			                         : std::min(piece - offset,
+			                                    FreshMemory::Granule - ((address - fresh->base) & (FreshMemory::Granule - 1)));
+			const auto begin = at + offset;
+			offset += bytes;
+			if (granule == UINT64_MAX || FreshMemory::IsWritten(*fresh, granule)) continue;
+			if ((begin & (TRACKER_PAGE_SIZE - 1)) != 0 || (bytes & (TRACKER_PAGE_SIZE - 1)) != 0 ||
+			    m_fresh_parts.contains(begin)) {
+				// (Not whole pages, or watched already: counted as written rather than half watched.)
+				if (FreshMemory::MarkGranule(*fresh, granule)) fresh->marked.fetch_add(FreshMemory::Granule);
+				FreshUnwatchGranule(granule);
+				continue;
+			}
+			m_fresh_parts.emplace(begin, FreshPart {begin + bytes, granule});
+			m_fresh_granules[granule].push_back(begin);
+			FreshMemory::SetArmed(*fresh, granule, true);
+			fresh->watched_bytes.fetch_add(bytes, std::memory_order_relaxed);
+			if (begin != run_end) flush();
+			if (run_end == 0) run_begin = begin;
+			run_end = begin + bytes;
+		}
+		done += piece;
+	}
+	flush();
+}
+
+void GpuResourceManager::FreshUnwatchGranule(uint64_t granule) {
+	const auto found = m_fresh_granules.find(granule);
+	if (found == m_fresh_granules.end()) return;
+	for (const auto begin: found->second) {
+		const auto part = m_fresh_parts.find(begin);
+		if (part == m_fresh_parts.end()) continue;
+		m_page_manager.UpdatePageWatchers<false>(begin, part->second.end - begin);
+		m_fresh_parts.erase(part);
+	}
+	m_fresh_granules.erase(found);
+	if (auto* fresh = FreshMemory::Get()) FreshMemory::SetArmed(*fresh, granule, false);
+}
+
+void GpuResourceManager::FreshUnwatch(uint64_t vaddr, uint64_t size, bool mark) {
+	auto* fresh = FreshMemory::Get();
+	if (fresh == nullptr || size == 0) return;
+	std::lock_guard       lock(m_fresh_mutex);
+	std::vector<uint64_t> granules;
+	auto                  it = m_fresh_parts.upper_bound(vaddr);
+	if (it != m_fresh_parts.begin()) --it;
+	for (; it != m_fresh_parts.end() && it->first < vaddr + size; ++it) {
+		if (it->second.end <= vaddr) continue;
+		// (A part left partly mapped loses its watch with the others: written.)
+		const bool whole = it->first >= vaddr && it->second.end <= vaddr + size;
+		if ((mark || !whole) && FreshMemory::MarkGranule(*fresh, it->second.granule))
+			fresh->marked.fetch_add(FreshMemory::Granule);
+		granules.push_back(it->second.granule);
+	}
+	for (const auto granule: granules) FreshUnwatchGranule(granule);
+}
+
+bool GpuResourceManager::FreshFirstWrite(uint64_t vaddr) {
+	auto* fresh = FreshMemory::Get();
+	if (fresh == nullptr) return false;
+	std::lock_guard lock(m_fresh_mutex);
+	auto            it = m_fresh_parts.upper_bound(vaddr);
+	if (it == m_fresh_parts.begin()) return false;
+	--it;
+	if (vaddr >= it->second.end) return false;
+	const auto granule = it->second.granule;
+	if (FreshMemory::MarkGranule(*fresh, granule)) fresh->faults.fetch_add(FreshMemory::Granule);
+	FreshUnwatchGranule(granule);
+	return true;
+}
+
+void GpuResourceManager::FreshOverwrite(uint64_t vaddr, uint64_t size) {
+	if (FreshMemory::Get() == nullptr || size == 0) return;
+	FreshMemory::MarkGuestRange(vaddr, size);
+	FreshUnwatch(vaddr, size, true);
 }
 
 void GpuResourceManager::RunCollectors() {
@@ -454,6 +644,7 @@ void GpuResourceManager::RunCollectors() {
 	// buffer collected under it faults back at once, and each registration invalidates every BDA
 	// region proof. Buffers are collected only after a frame without such shaders.
 	m_buffer_cache.RunGarbageCollector(!std::exchange(m_bda_used, false));
+	LibKernel::Memory::CoolHotReads();
 }
 
 } // namespace Libs::Graphics

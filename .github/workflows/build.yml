@@ -74,6 +74,21 @@ jobs:
           Copy-Item _Build\streamline-src\include _Build\deps\streamline\sdk -Recurse
           Get-ChildItem _Build\deps\streamline\sdk\include -Name
 
+      # AMD's FSR runtime (src/local/frame-gen.cpp: KYTY_FRAMEGEN_BACKEND=fsr, and FSR 4 upscaling for KYTY_UPSCALER=fsr):
+      # AMD FSR SDK 2.4's API headers (MIT, LICENSES/FidelityFX-SDK-MIT.txt) at build time, in their layout; its runtime
+      # (the DLLs signed by AMD) is the user's own, next to the emulator. Without them the build has no AMD runtime path.
+      - name: FSR SDK headers
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          git clone --quiet --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git _Build\fsr-sdk-src
+          git -C _Build\fsr-sdk-src sparse-checkout set Kits/FidelityFX/api/include Kits/FidelityFX/framegeneration/include Kits/FidelityFX/upscalers/include
+          foreach ($folder in 'api', 'framegeneration', 'upscalers') {
+            New-Item -ItemType Directory -Force "_Build\deps\fsr-sdk\Kits\FidelityFX\$folder" | Out-Null
+            Copy-Item "_Build\fsr-sdk-src\Kits\FidelityFX\$folder\include" "_Build\deps\fsr-sdk\Kits\FidelityFX\$folder" -Recurse
+          }
+          Get-ChildItem _Build\deps\fsr-sdk -Recurse -Name -Filter *.h
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
@@ -82,6 +97,11 @@ jobs:
         run: |
           call build-windows.cmd kyty_emulator || exit /b 1
           call build-windows.cmd kyty_shader_precompile || exit /b 1
+
+      # The settings window (launcher-windows: WPF on .NET Framework 4.7.2, part of Windows 10 and 11).
+      - name: Build launcher
+        shell: cmd
+        run: call launcher-windows\build.cmd || exit /b 1
 
       - name: Package
         shell: pwsh
@@ -92,7 +112,7 @@ jobs:
           $out = "_Build\package\$env:PACKAGE"
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
-            run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
+            _Build\launcher\KytyLauncher.exe, run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
@@ -115,13 +135,13 @@ jobs:
           Set-Content "$out\run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'rem Starts the game; the options are those of run-windows.ps1 (e.g. run.cmd -Fullscreen).',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow %*',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow %*',
             'if %errorlevel% neq 0 pause')
           Set-Content "$out\precompile.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'rem Every shader and pipeline of the game into the static pipeline cache: hours on a few cores (run it',
             'rem overnight, it resumes when interrupted). Options: those of precompile-windows.ps1.',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
             'pause')
           $root = (Resolve-Path $out).Path
           Get-ChildItem $out -Recurse -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($root.Length + 1) }
@@ -164,12 +184,23 @@ jobs:
           # A tag's own release, else a new tag named after the package at this commit.
           tag="$GITHUB_REF_NAME"
           [ "$GITHUB_REF_TYPE" = tag ] || tag="$PACKAGE"
-          notes="Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000). Unzip it and double-click run.cmd or launcher.cmd; the README.md inside explains the rest."
+          notes="Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000). Unzip it and double-click KytyLauncher.exe (or run.cmd); the README.md inside explains the rest."
+          # A tag's release holds both packages, and either job may make it (the other uploads to it): the same title
+          # and header whichever does (build.yml, build-linux.yml). v20261024's Linux job came first and titled it as
+          # the Linux package's.
+          title="$PACKAGE"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            title="KytyPS5-$tag"
+            notes="$(printf '%s\n\n%s\n\n%s' \
+              "Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000): KytyPS5-$tag.zip. Unzip it and double-click KytyLauncher.exe (or run.cmd); the README.md inside explains the rest." \
+              "Linux x64 build: KytyPS5-linux-$tag.zip. Unzip it and run ./kyty_launcher (the settings window), or ./run_ds.sh with KYTY_GAME set to the game; the README.md inside explains the rest." \
+              "Steam Deck build: KytyPS5-steamdeck-$tag.zip. Unzip it into ~/KytyPS5 and add run-deck.sh to Steam as a non-Steam game; STEAM-DECK.md inside explains the rest.")"
+          fi
           # The notes of this build (what changed, the per-PC shader caches, frame rates), when the commit has them.
           if [ -s notes/docs/RELEASE-NOTES.md ]; then notes="$(printf '%s\n\n%s' "$notes" "$(cat notes/docs/RELEASE-NOTES.md)")"; fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$PACKAGE" --notes "$notes" --latest
+              --title "$title" --notes "$notes" --latest
           fi

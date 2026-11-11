@@ -134,8 +134,6 @@ endif()
 project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
-	${KYTY_THIRD_PARTY_DIR}/gtest/include
-	${KYTY_THIRD_PARTY_DIR}/gtest
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
 	${PROJECT_BINARY_DIR}
@@ -180,6 +178,27 @@ endif()
 
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
+# Windows: the emulator's operator new/delete from mimalloc under KYTY_SPECULATE=4 (src/main.cpp; KYTY_MIMALLOC=0 / 1
+# at run time chooses the CRT heap / mimalloc; mode 0 keeps the CRT heap). Vendored: 3rdparty/mimalloc, v2.5.2.
+# (Linux: not built; preload libmimalloc.so instead.)
+if(WIN32)
+	set(kyty_mimalloc_default ON)
+else()
+	set(kyty_mimalloc_default OFF)
+endif()
+option(KYTY_MIMALLOC "Windows: operator new/delete from mimalloc (vendored, v2.5.2)" ${kyty_mimalloc_default})
+if(KYTY_MIMALLOC AND NOT WIN32)
+	message(FATAL_ERROR "KYTY_MIMALLOC is Windows-only (src/main.cpp); on Linux preload libmimalloc.so")
+endif()
+
+# A build for the Steam Deck (tools/local/deck/build-deck.sh: -march=znver2, Linux): KYTY_STEAM_DECK=1 in the code
+# selects its defaults and code paths: four Zen 2 cores, an RDNA 2 GPU of 8 compute units, 16 GB of memory the two
+# share.
+option(KYTY_STEAM_DECK "Build for the Steam Deck" OFF)
+if(KYTY_STEAM_DECK)
+	add_compile_definitions(KYTY_STEAM_DECK=1)
+endif()
+
 config_compiler_and_linker()
 
 if(KYTY_CLANG_CL)
@@ -209,6 +228,18 @@ if(KYTY_CLANG_CL)
 		add_compile_options(-fprofile-instr-generate)
 		add_compile_definitions(KYTY_PGO_GENERATE=1)
 		link_libraries("${kyty_profile_runtime}")
+	elseif(KYTY_PGO_USE)
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	endif()
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	# Linux: the same PGO switches. The profile must be made on Linux (tools/pgo is clang-cl's).
+	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
+	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
+	if(KYTY_PGO_GENERATE)
+		add_compile_options(-fprofile-instr-generate)
+		add_link_options(-fprofile-instr-generate)
+		add_compile_definitions(KYTY_PGO_GENERATE=1)
 	elseif(KYTY_PGO_USE)
 		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
 		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
@@ -332,7 +363,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024 -DFAULT_WORDS_PER_INVOCATION=16u
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -358,11 +389,44 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# The game's exposure on the upscaled image of its super resolution path (renderSuperResolution.cpp).
+set(sr_exposure_source "${KYTY_SOURCE_DIR}/local/sr-exposure.comp")
+set(sr_exposure_spv "${gpu_tiler_generated_dir}/sr_exposure.spv")
+set(sr_exposure_header "${gpu_tiler_generated_dir}/sr_exposure_spv.h")
+add_custom_command(
+	OUTPUT "${sr_exposure_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${sr_exposure_spv}" "${sr_exposure_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${sr_exposure_spv} -DOUTPUT=${sr_exposure_header}
+	        -DSYMBOL=SR_EXPOSURE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${sr_exposure_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${sr_exposure_header}")
+# ... and with DLSS's sharpening (KYTY_DLSS_SHARPNESS, sr-sharpen.comp).
+set(sr_sharpen_source "${KYTY_SOURCE_DIR}/local/sr-sharpen.comp")
+set(sr_sharpen_spv "${gpu_tiler_generated_dir}/sr_sharpen.spv")
+set(sr_sharpen_header "${gpu_tiler_generated_dir}/sr_sharpen_spv.h")
+add_custom_command(
+	OUTPUT "${sr_sharpen_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${sr_sharpen_spv}" "${sr_sharpen_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${sr_sharpen_spv} -DOUTPUT=${sr_sharpen_header}
+	        -DSYMBOL=SR_SHARPEN_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${sr_sharpen_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${sr_sharpen_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_imgui_hdr.frag"
+	"${gpu_tiler_shader_dir}/fsr_hud_mask.frag"
+	"${gpu_tiler_shader_dir}/present_dither.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -390,6 +454,14 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/frame-gen-hudless.h"
+	"${KYTY_SOURCE_DIR}/local/frame-gen-hudless.cpp"
+	"${KYTY_SOURCE_DIR}/local/screenshot.h"
+	"${KYTY_SOURCE_DIR}/local/screenshot.cpp"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr-native.h"
+	"${KYTY_SOURCE_DIR}/local/fsr-native.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
@@ -403,7 +475,12 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus libzstd_static)
+# Linux and Windows: AMD FidelityFX FSR 3 built from source (3rdparty/fidelityfx) for KYTY_UPSCALER=fsr
+# (src/local/fsr-native.h); Windows' FSR frame generation loads AMD's runtime instead (frame-gen.cpp).
+if (LINUX OR WIN32)
+	list(APPEND kyty_emulator_link_libraries kyty_fidelityfx)
+endif()
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)
@@ -627,9 +704,14 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+add_kyty_full_emulator_test(pad_input_tests "${KYTY_TESTS_DIR}/PadInputTests.cpp")
 add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
 target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
+add_executable(save_data_backup_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataBackupTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/saveDataBackup.cpp")
+target_include_directories(save_data_backup_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(fiber_migration_tests
 	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
 
@@ -712,7 +794,9 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
 	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
+	add_test(NAME save_data_backup COMMAND $<TARGET_FILE:save_data_backup_tests>)
 	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -790,8 +874,10 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		pad_input_tests
 		fiber_migration_tests
 		save_data_capacity_tests
+		save_data_backup_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
@@ -803,6 +889,26 @@ endif()
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 
+# Windows: the programs' version information (src/kyty.rc.in; a program without any looked more like a trojan to
+# antivirus programs' machine learning, issue #135).
+if(WIN32)
+	string(REPLACE "." "," KYTY_RC_VERSION_COMMAS "${KYTY_VERSION}.0")
+	foreach(program kyty_emulator kyty_shader_precompile)
+		if(TARGET ${program})
+			# (The precompile program runs as the emulator, a link named kyty_emulator.exe - precompile-windows.ps1: AMD's
+			# driver keys its pipelines by the program's name -, so it is named the same here too.)
+			set(KYTY_RC_NAME kyty_emulator)
+			if(program STREQUAL "kyty_emulator")
+				set(KYTY_RC_DESCRIPTION "KytyPS5 PS5 emulator")
+			else()
+				set(KYTY_RC_DESCRIPTION "KytyPS5 shader precompile")
+			endif()
+			configure_file("${KYTY_SOURCE_DIR}/kyty.rc.in" "${PROJECT_BINARY_DIR}/${program}.rc" @ONLY)
+			target_sources(${program} PRIVATE "${PROJECT_BINARY_DIR}/${program}.rc")
+		endif()
+	endforeach()
+endif()
+
 if(LINUX)
 	set_property(SOURCE
 		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/graphicsRun.cpp"
@@ -810,6 +916,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/textureCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 		"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
@@ -824,6 +931,12 @@ if(LINUX)
 endif()
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+if(KYTY_MIMALLOC)
+	# main.cpp replaces operator new/delete for this executable only. (Redirecting every module's malloc as well,
+	# mimalloc.dll + mimalloc-redirect.dll, measured no faster: stone arch 55.8-56.2 fps on, 55.9-57.1 off.)
+	target_link_libraries(kyty_emulator mimalloc-static)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KYTY_MIMALLOC=1)
+endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)
@@ -840,8 +953,8 @@ endif()
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
-# Local frame generation experiments (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it
-# was unpacked under _Build/deps (never part of the repository). Its DLLs are loaded at run time.
+# Frame generation (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it was unpacked under _Build/deps
+# (never part of the repository). Its DLLs are loaded at run time.
 if (WIN32)
 	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
 	    "NVIDIA Streamline SDK for KYTY_FRAMEGEN (local only)")
@@ -851,6 +964,24 @@ if (WIN32)
 		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
 		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
 	endif()
+	# AMD's FSR runtime (KYTY_FRAMEGEN_BACKEND=fsr, and KYTY_UPSCALER=fsr with FSR SDK 2's): AMD FSR SDK 2.4's API
+	# headers (Kits/FidelityFX/api, framegeneration and upscalers include folders, MIT) when unpacked under
+	# _Build/deps/fsr-sdk; the runtime (amd_fidelityfx_loader_vk.dll with its effect DLLs, or FidelityFX SDK 1.1.4's
+	# amd_fidelityfx_vk.dll, signed by AMD) is the user's, next to the emulator.
+	set(KYTY_FSR_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/fsr-sdk" CACHE PATH
+	    "AMD FSR SDK 2 (its Kits/FidelityFX headers) for AMD's FSR runtime")
+	if (EXISTS "${KYTY_FSR_SDK}/Kits/FidelityFX/api/include/ffx_api.h")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             INCLUDE_DIRECTORIES "${KYTY_FSR_SDK}/Kits/FidelityFX")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_FSR=1)
+	endif()
+elseif (LINUX)
+	# Linux has no Streamline: DLSS (KYTY_UPSCALER=dlss) through NVIDIA's NGX, by the bridge libkyty_dlss.so that
+	# tools/local/dlss-bridge/build-dlss-linux.sh builds apart; loaded at run time (dlopen), the emulator links no NVIDIA
+	# code.
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+	             COMPILE_DEFINITIONS KYTY_FRAMEGEN_NGX=1)
 endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
@@ -894,8 +1025,7 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 
 # x86_64 Linux and Windows: the Vulkan recording worker (KYTY_VULKAN_RECORDING, with the
-# native XPR draws built on it) and the native resource preparation tests (the
-# ahead-of-time SRT library is loaded with dlopen on Linux, LoadLibrary on Windows).
+# native XPR draws built on it) and the native resource preparation tests.
 if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
 	set(recording_generated "${CMAKE_CURRENT_BINARY_DIR}/local-vulkan-recording.inc")
@@ -908,7 +1038,7 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
 	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests
-			virtual_memory_allocation_tests)
+			virtual_memory_allocation_tests pad_input_tests shader_cfg_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
 		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -921,10 +1051,9 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
 
 	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
-			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests)
+			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests pad_input_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
-		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})
 	endforeach()
 	if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_LINKER MATCHES "ld.lld$")
 		# Clang otherwise selected GNU ld/LLVMgold despite CMAKE_LINKER, which
@@ -960,6 +1089,14 @@ endif()
 
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+endif()
+# The Linux settings window (launcher-linux/): SDL2 and Dear ImGui, linked statically; build-linux.sh builds it with the
+# emulator and the Linux package carries it.
+if(LINUX)
+	option(KYTY_BUILD_LINUX_LAUNCHER "Build the Linux settings window (launcher-linux)" ON)
+	if(KYTY_BUILD_LINUX_LAUNCHER)
+		add_subdirectory(launcher-linux)
+	endif()
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)

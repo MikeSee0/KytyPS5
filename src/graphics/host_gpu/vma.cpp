@@ -2,9 +2,12 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__clang__)
@@ -25,6 +28,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "frame-gen.h"
 #include "live-counters.h"
 #include "local-platform.h"
 
@@ -73,17 +78,24 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
-	// KYTY_VRAM_LIMIT_MB=<n>: video memory as on a GPU with n MiB (VMA's heap size limit): its budget,
-	// and allocations past it failing, for tests of memory pressure on smaller GPUs.
-	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_limits {};
-	if (const char* text = std::getenv("KYTY_VRAM_LIMIT_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0) {
-		heap_limits.fill(VK_WHOLE_SIZE);
-		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
-			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-				heap_limits[heap] = std::strtoull(text, nullptr, 10) << 20u;
-			}
+	// VMA's blocks: 64 MiB on a GPU with less than 13 GiB of video memory (KYTY_SIMULATE_VRAM_MB counts), VMA's 256 MiB
+	// on bigger ones. Such a GPU runs past its budget and the driver keeps part of the game's memory in system memory: 1-1
+	// tours with 8 GB, each order once: walk 70.0 vs 67.4 and 72.2 vs 69.6 fps, spin 68.3 vs 65.9 and 71.4 vs 69.1, the
+	// route's later two thirds 2-6% faster in both (the free space inside the blocks no smaller, 787 vs 545 MiB at the
+	// end: it is where the driver puts the smaller blocks). KYTY_VMA_BLOCK_MB=<n>: n MiB.
+	{
+		uint64_t video = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++)
+			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+				video = std::max<uint64_t>(video, physical_device_memory_properties.memoryHeaps[heap].size);
+		if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB"); simulate != nullptr && *simulate != '\0')
+			video = std::min<uint64_t>(video, std::strtoull(simulate, nullptr, 10) << 20u);
+		const char* text = std::getenv("KYTY_VMA_BLOCK_MB");
+		if (text != nullptr && std::strtoull(text, nullptr, 10) > 0) {
+			info.preferredLargeHeapBlockSize = std::strtoull(text, nullptr, 10) << 20u;
+		} else if (video != 0 && video < (uint64_t {13} << 30u)) {
+			info.preferredLargeHeapBlockSize = uint64_t {64} << 20u;
 		}
-		info.pHeapSizeLimit = heap_limits.data();
 	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
@@ -91,11 +103,11 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
-	// KYTY_SIMULATE_VRAM_MB=<n>: a GPU with n MiB of video memory, for tests on a bigger one. Unlike
-	// KYTY_VRAM_LIMIT_MB (an allocator limit: what it puts in system memory types the driver still places in video
-	// memory while there is room), the rest of the largest device-local heap is taken here at the highest priority
-	// and kept, so the driver and OS move the game's memory to system memory as on such a GPU. Budget and usage
-	// (GetTotalMemoryBudget, GetDeviceMemoryUsage) leave it out.
+	// KYTY_SIMULATE_VRAM_MB=<n>: a GPU with n MiB of video memory, for tests on a bigger one. Unlike an allocator limit
+	// (what VMA puts in system memory types the driver still places in video memory while there is room), the rest of
+	// the largest device-local heap is taken here at the highest priority and kept, so the driver and OS move the game's
+	// memory to system memory as on such a GPU. Budget and usage (GetTotalMemoryBudget, GetDeviceMemoryUsage) leave it
+	// out.
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB"); simulate != nullptr) {
 		const uint64_t simulated = std::strtoull(simulate, nullptr, 10) << 20u;
 		uint32_t       heap      = 0;
@@ -134,7 +146,42 @@ bool GraphicContext::CreateAllocator() {
 		physical_device.getProperties2(&device_properties);
 		if (id.deviceLUIDValid) (void)LocalPlatform::OpenVideoMemoryAdapter(id.deviceLUID.data());
 	}
-	small_video_memory = GetTotalMemoryBudget() < (uint64_t {12} << 30u);
+	// Frame generation's and super resolution's own allocations (FSR's about 1.3 GiB at 2560x1440: interpolation, optical
+	// flow, its swapchain; DLSS-G's alike; outside this allocator but in its budget) leave the game that much less, so a
+	// budget short of 12 GiB after them counts as small (a 16 GB card whose budget other programs had cut to 12.2 GiB ran
+	// out with FSR; issue #215: a 16 GB RTX 5080 with DLSS-G and DLSS ran out with the texture pools kept).
+	const uint64_t reserved = Libs::Graphics::FrameGen::VideoMemoryReserve();
+	small_video_memory      = GetTotalMemoryBudget() < (uint64_t {12} << 30u) + reserved;
+	uint64_t video_memory   = 0; // (the largest device-local heap, less a simulation's ballast)
+	for (uint32_t i = 0; i < physical_device_memory_properties.memoryHeapCount; i++)
+		if (physical_device_memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+			video_memory = std::max<uint64_t>(video_memory, physical_device_memory_properties.memoryHeaps[i].size);
+	reduce_texture_levels = video_memory - std::min(video_memory, simulation_ballast_bytes) <= (uint64_t {12} << 30u);
+	if (reserved != 0) {
+		std::printf("Video memory: %" PRIu64 " MiB of budget, %" PRIu64 " MiB of it left to frame generation and super "
+		            "resolution: %s\n",
+		            GetTotalMemoryBudget() >> 20u, reserved >> 20u,
+		            small_video_memory ? "the game's use sized as on a card short of video memory (texture pools retire)"
+		                               : "room enough for the game's");
+	}
+	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
+	// for big ones, as in the default pools).
+	if (const char* defrag = std::getenv("KYTY_BUFFER_DEFRAG");
+	    defrag == nullptr ? small_video_memory : std::strcmp(defrag, "0") != 0) {
+		VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		buffer.size  = uint64_t {64} << 10u;
+		buffer.usage = static_cast<VkBufferUsageFlags>(AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
+		VmaAllocationCreateInfo allocation {};
+		allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		uint32_t type    = 0;
+		VmaPoolCreateInfo pool {};
+		if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &buffer, &allocation, &type) == VK_SUCCESS) {
+			pool.memoryTypeIndex = type;
+			if (vmaCreatePool(allocator, &pool, &game_buffer_pool) != VK_SUCCESS) game_buffer_pool = nullptr;
+		}
+		std::printf("Game buffers: %s\n", game_buffer_pool != nullptr ? "own pool, compacted (KYTY_BUFFER_DEFRAG=0 turns it off)"
+		                                                               : "pool failed, default pools");
+	}
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;
@@ -154,6 +201,13 @@ void GraphicContext::DestroyAllocator() {
 	g_report_context           = nullptr;
 	FlushBufferReclaimer();
 	DestroyImagePool(allocator);
+	if (game_buffer_pool != nullptr) {
+		// (Only empty: a buffer still alive frees its memory into it later.)
+		VmaStatistics statistics {};
+		vmaGetPoolStatistics(allocator, game_buffer_pool, &statistics);
+		if (statistics.allocationCount == 0) vmaDestroyPool(allocator, game_buffer_pool);
+		game_buffer_pool = nullptr;
+	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 	for (const auto memory: simulation_ballast) device.freeMemory(memory);
@@ -301,7 +355,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 // and its memory for identical creation parameters is equivalent to a fresh
 // allocation.
 extern "C" {
-volatile std::atomic<uint32_t> kyty_local_image_pool_mode {0};
+volatile std::atomic<uint32_t> kyty_local_image_pool_mode {1};
 }
 namespace {
 struct PooledImage {
@@ -363,7 +417,101 @@ void GraphicContext::ReportMemoryFallback(const char* what, uint64_t bytes) cons
 	std::fflush(stdout);
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+// Issue #228: an RX 9070 with 5.4 GB of its 15.4 GB of video memory free refused a 108 MB buffer at a world load, the
+// PC's RAM nearly full (2 GB of 24 GB left), and the emulator exited: which memory refused it was not known.
+void GraphicContext::DescribeAllocationFailure(const char* what, uint64_t bytes) const {
+	static std::atomic<uint32_t> described {0};
+	if (described.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+	VmaTotalStatistics statistics {};
+	vmaCalculateStatistics(allocator, &statistics);
+	const auto commit = LocalPlatform::SystemCommit();
+	std::printf("Vulkan: %s of %" PRIu64 " MiB not made: VMA holds %u memory objects (the GPU's limit %u); the PC has %" PRIu64
+	            " MiB of RAM left and %" PRIu64 " MiB to commit of %" PRIu64 " MiB\n",
+	            what, bytes >> 20u, statistics.total.statistics.blockCount, physical_device_properties.limits.maxMemoryAllocationCount,
+	            LocalPlatform::AvailablePhysicalMemory() >> 20u, commit.available >> 20u, commit.limit >> 20u);
+	// The driver asked directly for the same size (with a device address, as VMA asks), in the first memory type of each
+	// kind: video memory, and system memory the CPU sees.
+	const auto& memory = GetPhysicalDeviceMemoryProperties();
+	for (const bool video: {true, false}) {
+		for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+			const auto flags = memory.memoryTypes[type].propertyFlags;
+			if (static_cast<bool>(flags & vk::MemoryPropertyFlagBits::eDeviceLocal) != video ||
+			    (!video && !(flags & vk::MemoryPropertyFlagBits::eHostVisible)))
+				continue;
+			vk::MemoryAllocateFlagsInfo address {};
+			address.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+			vk::MemoryAllocateInfo info {};
+			info.pNext           = &address;
+			info.allocationSize  = std::max<uint64_t>(bytes, uint64_t {64} << 10u);
+			info.memoryTypeIndex = type;
+			vk::DeviceMemory probe  = nullptr;
+			const auto       result = device.allocateMemory(&info, nullptr, &probe);
+			if (result == vk::Result::eSuccess) device.freeMemory(probe, nullptr);
+			std::printf("  the driver for the same size in memory type %u (heap %u, %s): %s\n", type,
+			            memory.memoryTypes[type].heapIndex, video ? "video memory" : "system memory", vk::to_string(result).c_str());
+			break;
+		}
+	}
+	std::fflush(stdout);
+}
+
+bool GraphicContext::RetryAllocation(const char* what, uint64_t bytes, const std::function<bool()>& create) {
+	DescribeAllocationFailure(what, bytes);
+	const auto start = std::chrono::steady_clock::now();
+	for (int attempt = 0; attempt < 100; attempt++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		TrimImagePool();
+		if (create()) {
+			const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+			std::printf("Vulkan: %s of %" PRIu64 " MiB made after waiting %lld ms\n", what, bytes >> 20u,
+			            static_cast<long long>(waited.count()));
+			std::fflush(stdout);
+			return true;
+		}
+	}
+	std::printf("Vulkan: %s of %" PRIu64 " MiB still not made after 10 s\n", what, bytes >> 20u);
+	std::fflush(stdout);
+	return false;
+}
+
+// The textures made in the host-preferred type (CreateImage): the memory type VMA chose and its heap (a heap Vulkan lists as system
+// memory: every sample over PCIe, unless the driver keeps the type in video memory, as NVIDIA's Windows driver does while there is
+// room: the Video memory lines' plain type), printed at every further 256 MiB of them (the GPU thread's; not freed counts).
+void GraphicContext::NoteHostPreferredTexture(VmaAllocation allocation, double host_at) {
+	// (The GPU thread makes the textures, the present thread its frame image: both reach here.)
+	static std::mutex mutex;
+	std::scoped_lock  lock(mutex);
+	static uint64_t   images = 0, bytes = 0, system_bytes = 0, next = 0;
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	const auto& memory = GetPhysicalDeviceMemoryProperties();
+	const bool  system = info.memoryType < memory.memoryTypeCount &&
+	                    !(memory.memoryHeaps[memory.memoryTypes[info.memoryType].heapIndex].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+	images++;
+	bytes += info.size;
+	system_bytes += system ? info.size : 0;
+	if (bytes < next) return;
+	next = bytes + (uint64_t {256} << 20u);
+	// (Each heap's usage against its budget, VK_EXT_memory_budget through VMA: where the no-flags images actually live.)
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	std::string heaps;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		char part[96];
+		std::snprintf(part, sizeof(part), "%s heap %u (%s) %" PRIu64 " of %" PRIu64 " MiB", heap == 0 ? "" : ",", heap,
+		              (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? "video" : "system",
+		              static_cast<uint64_t>(budgets[heap].usage) >> 20u, static_cast<uint64_t>(budgets[heap].budget) >> 20u);
+		heaps += part;
+	}
+	std::printf("Textures placed past the threshold (from %.2f of the budget, KYTY_TEXTURE_HOST_AT; mode %s): %" PRIu64 " made, %" PRIu64
+	            " MiB, %" PRIu64 " MiB of them in a heap listed as system memory (memory type %u now; where the driver keeps them: the Video memory "
+	            "lines' plain type); heaps:%s\n",
+	            host_at, std::getenv("KYTY_TEXTURE_HOST_MODE") != nullptr ? std::getenv("KYTY_TEXTURE_HOST_MODE") : "host", images,
+	            bytes >> 20u, system_bytes >> 20u, info.memoryType, heaps.c_str());
+	std::fflush(stdout);
+}
+
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image, bool guest_texture) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
@@ -403,10 +551,36 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// fails device-local allocations past its video memory: what came last went to system memory, 8 GB at 1-1:
 	// 22 fps, textures yielding: ~45). It counts that type under the video memory heap: on 8 GB, half is reached
 	// before the first texture.
-	const bool texture = IsTextureUsage(image_info.usage);
-	if (texture && small_video_memory && GetDeviceMemoryUsage() >= GetTotalMemoryBudget() / 2) {
+	// KYTY_TEXTURE_HOST_AT=<fraction> (boot env, (0, 1], default 0.5: the half above): the budget use from which textures go to that
+	// type (PR #284: on Linux, where that type is system memory, the 1-1 pixel-heavy table draws read such textures over PCIe).
+	static const double host_at = [] {
+		const char*  value    = std::getenv("KYTY_TEXTURE_HOST_AT");
+		const double fraction = value != nullptr ? std::strtod(value, nullptr) : 0.0;
+		const double used     = fraction > 0.0 && fraction <= 1.0 ? fraction : 0.5;
+		// (The bench's engage line: read at the first image, early in the boot.)
+		if (value != nullptr) std::printf("Textures: host-preferred from %.2f of the budget (KYTY_TEXTURE_HOST_AT=%s)\n", used, value);
+		return used;
+	}();
+	// KYTY_TEXTURE_HOST_MODE (boot env; default: the above): pd = past the threshold a guest texture may go anywhere but prefers video
+	// memory (requiredFlags 0, preferredFlags DEVICE_LOCAL, no AUTO_PREFER_HOST: VMA, given AUTO_PREFER_HOST and no host access, marks
+	// DEVICE_LOCAL not preferred, vk_mem_alloc.h ~4347, so those textures asked for a type outside video memory up front, the driver never
+	// choosing): system memory only when video memory fails; and the emulator's own images (the presenter's frame, frame generation's
+	// inputs, the HUD source) always video memory, as render targets are.
+	static const bool prefer_device = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_HOST_MODE");
+		const bool  pd    = value != nullptr && std::strcmp(value, "pd") == 0;
+		if (pd) std::printf("Textures: host mode pd (KYTY_TEXTURE_HOST_MODE=pd: guest textures prefer video memory past the threshold, "
+		                    "the emulator's images always video memory)\n");
+		return pd;
+	}();
+	const bool texture = IsTextureUsage(image_info.usage) && (!prefer_device || guest_texture);
+	const bool host_preferred =
+	    texture && small_video_memory &&
+	    static_cast<double>(GetDeviceMemoryUsage()) >= static_cast<double>(GetTotalMemoryBudget()) * host_at;
+	if (host_preferred) {
 		alloc_info.requiredFlags = 0;
-		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		if (prefer_device) alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		else alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
 	vk::Result result = vk::Result::eSuccess;
 	const auto create = [&] {
@@ -433,11 +607,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 				// (Which memory ran out: OUT_OF_HOST_MEMORY is the system's commit, OUT_OF_DEVICE_MEMORY the GPU's.)
 				const auto what = "an image could not be created (" + vk::to_string(result) + ")";
 				ReportMemoryFallback(what.c_str(), 0);
+				// (No retry here: an image that may fail, a texture pool's view, is drawn without it instead.)
+				vk::Image      probe = nullptr;
+				vk::DeviceSize size  = 0;
+				if (device.createImage(&image_info, nullptr, &probe) == vk::Result::eSuccess) {
+					size = device.getImageMemoryRequirements(probe).size;
+					device.destroyImage(probe, nullptr);
+				}
+				DescribeAllocationFailure("an image", size);
 				return false;
 			}
 		}
 	}
 
+	if (host_preferred) NoteHostPreferredTexture(image.allocation, host_at);
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;

@@ -7,6 +7,7 @@
 #include <bit>
 #include <bitset>
 #include <deque>
+#include <set>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -23,10 +24,7 @@
 // - a lane mask only selects lanes (EXEC, a V_CNDMASK or carry select, masks combined bit by bit) and is made from
 //   compares and EXEC (or is 0 / -1): other scalar bits hold the wave's layout, lanes 32-63 in the high word;
 // - V_READFIRSTLANE, with an active lane in the half, reads either a value the same in every lane (computed from
-//   scalar values under the same EXEC; with KYTY_LANE_LOCAL_UNIFORM_LOADS=1, for a program the proof refuses
-//   otherwise, also loaded by a buffer load whose address is: the program then holds
-//   IR::Program::lane_local_uniform_loads, and CompileProgram runs it two lanes per invocation where a buffer adds
-//   the lane to its index, ADD_TID) or the head of a waterfall loop (the lanes equal to it run the loop body, then
+//   scalar values under the same EXEC) or the head of a waterfall loop (the lanes equal to it run the loop body, then
 //   leave: every lane runs once with its own value, whichever lane was first);
 // - DPP within a row of 16 lanes, V_PERMLANE(X)16 within a half, quad modes.
 // A branch on EXEC or VCC goes another way for a half than for the wave only when none of the half's lanes is active
@@ -256,6 +254,9 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_BITREPLICATE_B64_B32: return "lane-mask layout";
 		case Opcode::S_GETPC_B64:
+			// (TranslatorFeatureLaneLocalWide: a scalar the same in every lane, written as a constant would be.)
+			if ((TranslatorFeatureSet() & TranslatorFeatureLaneLocalWide) != 0) return nullptr;
+			[[fallthrough]];
 		case Opcode::S_SETPC_B64:
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END: return "program counter";
@@ -268,8 +269,9 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::UNSUPPORTED: return "unknown instruction";
 		default: break;
 	}
-	// LDS: a wave's lanes may exchange data there without a barrier (a 64-thread group has none).
-	if (inst.family == Family::DS) return "LDS";
+	// LDS: a wave's lanes may exchange data there without a barrier (a 64-thread group has none); under
+	// TranslatorFeatureLaneLocalWide, plain reads and writes with barriers placed between (LdsBarriers).
+	if (inst.family == Family::DS) return (TranslatorFeatureSet() & TranslatorFeatureLaneLocalWide) != 0 ? nullptr : "LDS";
 	return nullptr;
 }
 
@@ -296,7 +298,6 @@ struct State {
 	std::bitset<256> uniform;  // VGPRs the same in every active lane (computed from scalar values under this EXEC)
 	bool             scc_mask = false;
 	bool             active   = true; // each half has an active lane
-	bool             uniform_load_rule = false; // UniformLoad applies (the proof's second pass)
 	bool             operator==(const State&) const = default;
 
 	void Join(const State& other) {
@@ -308,7 +309,6 @@ struct State {
 		uniform &= other.uniform;
 		scc_mask = scc_mask || other.scc_mask;
 		active   = active && other.active;
-		uniform_load_rule = uniform_load_rule || other.uniform_load_rule;
 	}
 };
 
@@ -330,9 +330,8 @@ using Syms = std::array<Sym, 128>;
 
 class Analysis {
 public:
-	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool uniform_load_rule = false,
-	         bool cooperative = false)
-	    : m_program(program), m_cfg(cfg), m_uniform_load_rule(uniform_load_rule), m_cooperative(cooperative) {}
+	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool cooperative = false)
+	    : m_program(program), m_cfg(cfg), m_cooperative(cooperative) {}
 
 	bool Run(std::string* reason) {
 		const auto& blocks = m_cfg.blocks;
@@ -365,7 +364,6 @@ private:
 		size_t             entry = 0;
 		if (const auto found = m_index_of.find(m_cfg.entry_block); found != m_index_of.end()) entry = found->second;
 		in[entry].mask.set(ExecLo).set(ExecHi);
-		in[entry].uniform_load_rule = m_uniform_load_rule;
 		reached[entry] = true;
 		// The masks a block may receive (union) and the facts it surely receives (intersection), to a fixpoint.
 		std::deque<size_t> work {entry};
@@ -490,33 +488,6 @@ private:
 	static bool WritesExec(const Instruction& inst) {
 		const auto index = ScalarIndex(inst.dst);
 		return index == ExecLo || index == ExecHi || SaveExec(inst.opcode);
-	}
-
-	// The proof's second pass (UniformLoadsEnabled): a buffer load at the same address in every lane loads the same
-	// value in every lane, unless the buffer adds the lane to its index (ADD_TID: a descriptor bit only the
-	// specialization knows, CompileProgram). A buffer load (not a store or an atomic) whose index and offset VGPRs,
-	// descriptor and scalar offset are the same in every active lane.
-	static bool UniformLoad(const Instruction& inst, const State& state) {
-		if (!state.uniform_load_rule || (inst.family != Family::MUBUF && inst.family != Family::MTBUF)) return false;
-		const auto name = magic_enum::enum_name(inst.opcode);
-		// (A 16-bit load keeps the other half of its register.)
-		if ((!name.starts_with("BUFFER_LOAD_") && !name.starts_with("TBUFFER_LOAD_")) || name.find("D16") != name.npos)
-			return false;
-		if (inst.src0.kind != OperandKind::Vgpr) return false;
-		const auto vgpr = [&](uint32_t reg) { return reg < 256 && state.uniform.test(reg); };
-		if (inst.idxen && !vgpr(inst.src0.reg)) return false;
-		if (inst.offen && !vgpr(inst.idxen ? inst.src0.reg + 1 : inst.src0.reg)) return false;
-		bool mask = false;
-		if (ScalarIndex(inst.src1) < 0 || MaskIn(inst.src1, 4, state)) return false;
-		switch (inst.src2.kind) {
-			case OperandKind::IntegerInlineConstant:
-			case OperandKind::FloatInlineConstant:
-			case OperandKind::LiteralConstant: break;
-			default:
-				ReadScalar(inst, inst.src2, state, mask);
-				if (ScalarIndex(inst.src2) < 0 || mask) return false;
-		}
-		return true;
 	}
 
 	// Sources the same in every active lane: constants, scalar values (not masks), uniform VGPRs.
@@ -658,6 +629,9 @@ private:
 				if (SaveExec(inst.opcode)) {
 					WriteScalar(inst.dst, 2, true, state); // (the old EXEC)
 					SetPair(state.lanes, ScalarIndex(inst.dst), NameHas64(inst.opcode));
+					// SCC: whether the new EXEC has a lane, the wave's answer (a half's lanes alone could tell the halves
+					// apart: MaskSccSaveexecBranchesTheWholeWave).
+					state.scc_mask = true;
 					break;
 				}
 				if (inst.family != Family::SOPC && inst.dst.kind != OperandKind::Unknown) {
@@ -721,8 +695,7 @@ private:
 					const auto written = std::max({inst.data_dwords, inst.data_components,
 					                               static_cast<uint32_t>(std::popcount(inst.dmask)), 1u}) +
 					                     (inst.family == Family::MIMG ? 1u : 0u);
-					const bool uniform = UniformLoad(inst, before);
-					for (uint32_t k = 0; k < written && inst.dst.reg + k < 256; ++k) state.uniform.set(inst.dst.reg + k, uniform);
+					for (uint32_t k = 0; k < written && inst.dst.reg + k < 256; ++k) state.uniform.reset(inst.dst.reg + k);
 				}
 				break;
 			default: break;
@@ -787,6 +760,9 @@ private:
 		for (uint32_t s = 0; s < 4; ++s) {
 			const auto& source = *Source(inst, s);
 			if (source.dpp && !LaneLocalDpp(source.dpp_ctrl)) return "cross-row DPP";
+			// (The write condition takes the row from the half's lane: rows 2-3 of the wave read as 0-1 in the second.)
+			if (source.dpp && (source.dpp_row_mask & 3u) != ((source.dpp_row_mask >> 2u) & 3u))
+				return "a DPP row mask that treats the halves apart";
 			if (source.kind == OperandKind::VccZ || source.kind == OperandKind::ExecZ) return "VCCZ/EXECZ as data";
 			if (source.kind == OperandKind::Scc && state.scc_mask) return "SCC made from a lane mask";
 		}
@@ -1228,52 +1204,379 @@ private:
 
 	const Decoder::Program&              m_program;
 	const CFG::Graph&                    m_cfg;
-	bool                                 m_uniform_load_rule = false;
-	bool                                 m_cooperative       = false;
+	bool                                 m_cooperative = false;
 	std::unordered_map<uint32_t, size_t> m_index_of;
 	std::vector<bool>                    m_exact;    // (by block) a lane-mask branch the wave decides
 	std::vector<bool>                    m_exchange; // (by instruction) a lane read the wave runs
 };
 
-// KYTY_LANE_LOCAL_UNIFORM_LOADS=1: a program the proof refuses is tried again taking buffer loads at one address for
-// values the same in every lane (an engine prologue reads a count at a constant index, then V_READFIRSTLANE of it:
-// ~950 more of Demon's Souls' 1.07 programs lane-local, the biggest 1.97 M SPIR-V words -> 0.98 M, an NVIDIA compile
-// 82 -> 40 s). A program the first pass proves stays as it was, byte for byte.
-bool UniformLoadsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_LANE_LOCAL_UNIFORM_LOADS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+// LDS under TranslatorFeatureLaneLocalWide (the lane batch's (ii)): plain reads and writes of workgroup memory. A wave's
+// lanes may exchange data there with no barrier between (in lockstep on the guest); the halves of a lane-local wave
+// are two subgroups, ordered only by a barrier. So within each stretch of the program between barriers, an LDS access
+// that may meet an earlier one of another lane (a read after a write, a write after a read or a write) gets a
+// workgroup barrier between them, placed where every invocation passes it as often as the program's own barrier:
+// EXEC full, in the same loop as an existing barrier (or outside every loop), not in a per-lane loop, and on every
+// path through that loop's iteration (or through the program). Refused where no such place exists.
+// DS_*_ADDTID (the lane's dword at (M0 & 0xffff) + offset + 4 x lane, the lane the wave's: WaveLaneId) whose M0 is a
+// constant on every path: its window of the wave's 64 dwords is known. Two such accesses of one window never meet
+// another lane's, nor two of disjoint windows; any other pair (or one whose M0 is not proven) is plain.
+enum LdsAccess : uint8_t { LdsNone = 0, LdsRead = 1, LdsWrite = 2, LdsTidRead = 4, LdsTidWrite = 8 };
+
+// The LDS accesses since the last barrier: plain kinds, and the lane-window reads and writes by window.
+struct LdsPending {
+	uint8_t  plain     = LdsNone;
+	uint64_t tid_read  = 0;
+	uint64_t tid_write = 0;
+	bool     operator==(const LdsPending&) const = default;
+	void     operator|=(const LdsPending& other) {
+		plain |= other.plain;
+		tid_read |= other.tid_read;
+		tid_write |= other.tid_write;
+	}
+};
+
+// A plain LDS access (its kinds), or nullptr; `refused`: an LDS operation this rule does not take.
+uint8_t PlainLds(const Instruction& inst, const char** refused) {
+	if (inst.family != Family::DS) return LdsNone;
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (name.find("ADDTID") != std::string_view::npos) return name.starts_with("DS_READ") ? LdsTidRead : LdsTidWrite;
+	if (name.starts_with("DS_READ")) return LdsRead;
+	if (name.starts_with("DS_WRITE") && !name.starts_with("DS_WRXCHG")) return LdsWrite;
+	*refused = "an LDS operation other than a plain read or write";
+	return LdsNone;
 }
+
+bool WritesExec(const Instruction& inst) {
+	if (inst.dst.kind == OperandKind::ExecLo || inst.dst.kind == OperandKind::ExecHi) return true;
+	const auto name = magic_enum::enum_name(inst.opcode);
+	return name.starts_with("V_CMPX") || name.find("SAVEEXEC") != std::string_view::npos;
+}
+
+// EXEC all ones after `inst` (EXEC before: `full`).
+bool ExecFullAfter(const Instruction& inst, bool full) {
+	if (!WritesExec(inst)) return full;
+	return (inst.opcode == Opcode::S_MOV_B64 || inst.opcode == Opcode::S_MOV_B32) &&
+	       inst.src0.kind == OperandKind::IntegerInlineConstant && inst.src0.signed_val == -1;
+}
+
+class LdsBarriers {
+public:
+	LdsBarriers(const Decoder::Program& program, const CFG::Graph& cfg): m_program(program), m_cfg(cfg) {
+		for (size_t i = 0; i < cfg.blocks.size(); ++i) m_index_of[cfg.blocks[i].id] = i;
+		Windows();
+	}
+
+	// The PCs a barrier goes before; false (with `reason`) when the program is refused.
+	bool Run(std::vector<uint32_t>& before_pcs, std::string* reason) {
+		const auto& blocks = m_cfg.blocks;
+		bool        any    = false;
+		for (const auto& inst: m_program.instructions) {
+			const char* refused = nullptr;
+			if (PlainLds(inst, &refused) != LdsNone) any = true;
+			if (refused != nullptr) return Fail(reason, refused, inst.pc);
+		}
+		if (!any) return true;
+		ExecFacts();
+		for (int round = 0; round < 32; ++round) {
+			Pending();
+			// The first hazard in program order.
+			size_t hazard_block = SIZE_MAX, hazard_index = 0;
+			for (size_t b = 0; b < blocks.size() && hazard_block == SIZE_MAX; ++b) {
+				auto pending = m_pending_in[b];
+				for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) {
+					const auto& inst = m_program.instructions[i];
+					if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = {};
+					const auto access = Access(i);
+					if (access == LdsPending {}) continue;
+					if (Hazard(i, pending)) {
+						hazard_block = b;
+						hazard_index = i;
+						break;
+					}
+					pending |= access;
+				}
+			}
+			if (hazard_block == SIZE_MAX) {
+				before_pcs.assign(m_before.begin(), m_before.end());
+				std::ranges::sort(before_pcs);
+				return true;
+			}
+			const auto pc = Place(hazard_block, hazard_index);
+			if (pc == UINT32_MAX || m_before.contains(pc))
+				return Fail(reason, "no place every invocation passes for a barrier before an LDS access",
+				            m_program.instructions[hazard_index].pc);
+			m_before.insert(pc);
+		}
+		return Fail(reason, "too many LDS barriers", 0);
+	}
+
+private:
+	static bool Fail(std::string* reason, const char* why, uint32_t pc) {
+		if (reason != nullptr) *reason = fmt::format("{} at {:#x}", why, pc);
+		return false;
+	}
+
+	// EXEC all ones at each block's start (every lane: the invocations a lane-local group has).
+	void ExecFacts() {
+		const auto& blocks = m_cfg.blocks;
+		m_exec_in.assign(blocks.size(), true);
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				bool in = true;
+				if (blocks[b].id != m_cfg.entry_block)
+					for (const auto pred: blocks[b].predecessors) in = in && ExecOut(m_index_of.at(pred));
+				if (in != m_exec_in[b]) {
+					m_exec_in[b] = in;
+					changed      = true;
+				}
+			}
+		}
+	}
+
+	bool ExecOut(size_t b) const {
+		bool full = m_exec_in[b];
+		for (auto i = m_cfg.blocks[b].inst_begin; i < m_cfg.blocks[b].inst_end; ++i)
+			full = ExecFullAfter(m_program.instructions[i], full);
+		return full;
+	}
+
+	// The LDS access kinds since the last barrier on some path, at each block's start.
+	void Pending() {
+		const auto& blocks = m_cfg.blocks;
+		m_pending_in.assign(blocks.size(), LdsPending {});
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				LdsPending in;
+				for (const auto pred: blocks[b].predecessors) in |= PendingOut(m_index_of.at(pred));
+				if (in != m_pending_in[b]) {
+					m_pending_in[b] = in;
+					changed         = true;
+				}
+			}
+		}
+	}
+
+	LdsPending PendingOut(size_t b) const {
+		auto pending = m_pending_in[b];
+		for (auto i = m_cfg.blocks[b].inst_begin; i < m_cfg.blocks[b].inst_end; ++i) {
+			const auto& inst = m_program.instructions[i];
+			if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = {};
+			pending |= Access(i);
+		}
+		return pending;
+	}
+
+	// Instruction `i`'s access: a lane-window one where its window is known, else its plain kind.
+	LdsPending Access(size_t i) const {
+		const char* refused = nullptr;
+		const auto  kind    = PlainLds(m_program.instructions[i], &refused);
+		LdsPending  access;
+		if (kind == LdsTidRead || kind == LdsTidWrite) {
+			if (m_window[i] >= 0) {
+				(kind == LdsTidRead ? access.tid_read : access.tid_write) = uint64_t {1} << m_window[i];
+			} else {
+				access.plain = kind == LdsTidRead ? LdsRead : LdsWrite;
+			}
+			return access;
+		}
+		access.plain = kind;
+		return access;
+	}
+
+	// Whether instruction `i` may meet an earlier access of another lane among `pending`.
+	bool Hazard(size_t i, const LdsPending& pending) const {
+		const auto access = Access(i);
+		if (access.plain == LdsRead) return (pending.plain & LdsWrite) != 0 || pending.tid_write != 0;
+		if (access.plain == LdsWrite) return !(pending == LdsPending {});
+		const auto window = m_window[i];
+		const auto others = m_overlaps[window] & ~(uint64_t {1} << window);
+		if (access.tid_read != 0) return (pending.plain & LdsWrite) != 0 || (pending.tid_write & others) != 0;
+		return pending.plain != LdsNone || ((pending.tid_read | pending.tid_write) & others) != 0;
+	}
+
+	// M0 on every path to each DS_*_ADDTID: a constant gives its window (at most 64 of them; beyond, plain).
+	void Windows() {
+		const auto& blocks = m_cfg.blocks;
+		const auto& code   = m_program.instructions;
+		m_window.assign(code.size(), -1);
+		struct M0 {
+			uint8_t  state = 0; // (0 not reached, 1 a constant, 2 unknown)
+			uint32_t value = 0;
+			bool     operator==(const M0&) const = default;
+		};
+		const auto meet = [](M0 a, M0 b) {
+			if (a.state == 0) return b;
+			if (b.state == 0) return a;
+			return a.state == 1 && b.state == 1 && a.value == b.value ? a : M0 {2, 0};
+		};
+		const auto step = [](const Instruction& inst, M0 m0) {
+			const auto name = magic_enum::enum_name(inst.opcode);
+			if (name.starts_with("S_MOVREL")) return M0 {2, 0};
+			if (inst.dst.kind != OperandKind::M0 && inst.dst2.kind != OperandKind::M0) return m0;
+			const bool constant = inst.src0.kind == OperandKind::IntegerInlineConstant ||
+			                      inst.src0.kind == OperandKind::LiteralConstant;
+			if ((inst.opcode == Opcode::S_MOVK_I32 || inst.opcode == Opcode::S_MOV_B32) && constant)
+				return M0 {1, inst.src0.value};
+			return M0 {2, 0};
+		};
+		std::vector<M0> in(blocks.size());
+		const auto      out = [&](size_t b) {
+			auto m0 = in[b];
+			for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) m0 = step(code[i], m0);
+			return m0;
+		};
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				M0 m0 = blocks[b].id == m_cfg.entry_block ? M0 {2, 0} : M0 {};
+				for (const auto pred: blocks[b].predecessors) m0 = meet(m0, out(m_index_of.at(pred)));
+				if (!(m0 == in[b])) {
+					in[b]   = m0;
+					changed = true;
+				}
+			}
+		}
+		std::vector<uint32_t> bases;
+		for (size_t b = 0; b < blocks.size(); ++b) {
+			auto m0 = in[b];
+			for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) {
+				const char* refused = nullptr;
+				const auto  kind    = PlainLds(code[i], &refused);
+				if ((kind == LdsTidRead || kind == LdsTidWrite) && m0.state == 1) {
+					const uint32_t base = (m0.value & 0xffffu) + code[i].offset;
+					auto           at   = std::ranges::find(bases, base);
+					if (at == bases.end() && bases.size() < 64) at = bases.insert(bases.end(), base);
+					if (at != bases.end()) m_window[i] = static_cast<int8_t>(at - bases.begin());
+				}
+				m0 = step(code[i], m0);
+			}
+		}
+		// (Windows of 64 dwords meet where their bases are nearer than 256 bytes.)
+		m_overlaps.assign(bases.size(), 0);
+		for (size_t a = 0; a < bases.size(); ++a)
+			for (size_t c = 0; c < bases.size(); ++c)
+				if ((bases[a] > bases[c] ? bases[a] - bases[c] : bases[c] - bases[a]) < 256u)
+					m_overlaps[a] |= uint64_t {1} << c;
+	}
+
+	// Where a barrier goes for the hazard at instruction `index` of block `b`: the latest valid place after the last LDS
+	// access before it, in its block or up its dominators; UINT32_MAX for none.
+	uint32_t Place(size_t b, size_t index) const {
+		const auto& blocks = m_cfg.blocks;
+		size_t      block  = b;
+		size_t      limit  = index; // (places before instructions [first, limit])
+		for (int depth = 0; depth < 64; ++depth) {
+			// The last LDS access in this block before `limit`: places after it only.
+			size_t first = blocks[block].inst_begin;
+			for (size_t i = blocks[block].inst_begin; i < limit; ++i) {
+				const char* refused = nullptr;
+				if (PlainLds(m_program.instructions[i], &refused) != LdsNone) first = i + 1;
+			}
+			bool full = m_exec_in[block];
+			std::vector<bool> full_before(limit + 1 - blocks[block].inst_begin, false);
+			for (size_t i = blocks[block].inst_begin; i <= limit && i < blocks[block].inst_end; ++i) {
+				full_before[i - blocks[block].inst_begin] = full;
+				full = ExecFullAfter(m_program.instructions[i], full);
+			}
+			if (Uniform(block)) {
+				for (size_t i = std::min<size_t>(limit, blocks[block].inst_end - 1) + 1; i-- > first;)
+					if (full_before[i - blocks[block].inst_begin]) return m_program.instructions[i].pc;
+			}
+			if (first > blocks[block].inst_begin) return UINT32_MAX; // (an LDS access in this block: no place after it)
+			// Up to the immediate dominator.
+			const auto& tree = m_cfg.dominators;
+			const auto  id   = blocks[block].id;
+			if (id >= tree.parent.size() || tree.parent[id] == UINT32_MAX) return UINT32_MAX;
+			block = m_index_of.at(tree.parent[id]);
+			limit = blocks[block].inst_end - 1;
+		}
+		return UINT32_MAX;
+	}
+
+	// Every invocation passes this block as often as the program's own barrier: in the same loop as one (or in none),
+	// that loop not a per-lane one, and the block on every path of its iteration (or of the program).
+	bool Uniform(size_t block) const {
+		const auto&               blocks = m_cfg.blocks;
+		const auto                id     = blocks[block].id;
+		const CFG::NaturalLoop*   inner  = nullptr;
+		for (const auto& loop: m_cfg.natural_loops) {
+			const bool in = loop.header == id || std::ranges::find(loop.body_blocks, id) != loop.body_blocks.end();
+			if (in && (inner == nullptr || loop.body_blocks.size() < inner->body_blocks.size())) inner = &loop;
+		}
+		const auto in_loop = [&](uint32_t b) {
+			return inner == nullptr || inner->header == b ||
+			       std::ranges::find(inner->body_blocks, b) != inner->body_blocks.end();
+		};
+		if (inner != nullptr) {
+			bool barrier = false;
+			for (const auto& candidate: blocks)
+				if (in_loop(candidate.id))
+					for (auto i = candidate.inst_begin; i < candidate.inst_end; ++i)
+						barrier = barrier || m_program.instructions[i].opcode == Opcode::S_BARRIER;
+			if (!barrier) return false;
+			const auto* latch = m_cfg.FindBlock(inner->latch);
+			if (latch == nullptr || latch->inst_end == latch->inst_begin) return false;
+			const auto latch_op = m_program.instructions[latch->inst_end - 1].opcode;
+			if (latch_op == Opcode::S_CBRANCH_EXECZ || latch_op == Opcode::S_CBRANCH_EXECNZ ||
+			    latch_op == Opcode::S_CBRANCH_VCCZ || latch_op == Opcode::S_CBRANCH_VCCNZ)
+				return false;
+		}
+		// On every path: from the header (the entry) to the latch (an end), within the loop, without this block.
+		const uint32_t start = inner != nullptr ? inner->header : m_cfg.entry_block;
+		if (start == id) return true;
+		std::vector<bool>     seen(blocks.size(), false);
+		std::vector<uint32_t> stack {start};
+		while (!stack.empty()) {
+			const auto b = stack.back();
+			stack.pop_back();
+			const auto index = m_index_of.at(b);
+			if (b == id || seen[index]) continue;
+			seen[index] = true;
+			if (inner != nullptr ? b == inner->latch : blocks[index].successors.empty()) return false;
+			for (const auto next: blocks[index].successors)
+				if (in_loop(next) && !(inner != nullptr && next == inner->header)) stack.push_back(next);
+		}
+		return true;
+	}
+
+	const Decoder::Program&              m_program;
+	const CFG::Graph&                    m_cfg;
+	std::unordered_map<uint32_t, size_t> m_index_of;
+	std::vector<bool>                    m_exec_in;
+	std::vector<LdsPending>              m_pending_in;
+	std::vector<int8_t>                  m_window;   // (by instruction) a DS_*_ADDTID's window, or -1
+	std::vector<uint64_t>                m_overlaps; // (by window) the windows it meets
+	std::set<uint32_t>                   m_before;
+};
 
 } // namespace
 
-bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason, bool* uniform_loads) {
+bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason) {
 	LaneLocalProof proof;
-	const bool     lane_local = ProveWaveLaneLocal(program, false, proof, reason);
-	if (uniform_loads != nullptr) *uniform_loads = proof.uniform_loads;
-	return lane_local;
+	return ProveWaveLaneLocal(program, false, proof, reason);
 }
 
 bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof, std::string* reason) {
 	// (On the program's own branches: the structured graph routes some through variables, scalar state of its own.)
 	const auto cfg = CFG::BuildGraph(program);
 	proof          = {};
-	if (Analysis(program, cfg).Run(reason)) return true;
-	if (UniformLoadsEnabled() && Analysis(program, cfg, true).Run(reason)) {
-		proof.uniform_loads = true;
-		return true;
-	}
+	// (Its LDS accesses: the barriers between them, or no proof.)
+	const auto lds = [&] {
+		if ((TranslatorFeatureSet() & TranslatorFeatureLaneLocalWide) == 0) return true;
+		return LdsBarriers(program, cfg).Run(proof.lds_barriers, reason);
+	};
+	if (Analysis(program, cfg).Run(reason)) return lds();
 	if (!cooperative) return false;
 	std::string why;
-	Analysis    analysis(program, cfg, false, true);
+	Analysis    analysis(program, cfg, true);
 	if (!analysis.Run(&why)) {
 		if (reason != nullptr) *reason += " (cooperative: " + why + ")";
 		return false;
 	}
 	analysis.Exchanges(proof.exchange_reads, proof.wave_branches);
-	return true;
+	return lds();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

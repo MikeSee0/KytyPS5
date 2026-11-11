@@ -4,6 +4,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -15,6 +16,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-counters.h"
 #include "speculation-state.h"
 
@@ -24,6 +26,8 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <type_traits>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -53,7 +57,13 @@
 	    [[maybe_unused]] uint32_t num_dw
 #define KYTY_CP_OP_PARSER(f) uint32_t f(KYTY_CP_OP_PARSER_ARGS)
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace Libs::Graphics {
+
+static bool HwCtxIsFakeRegister(uint32_t cmd_offset); // (GuardTable, below)
 
 namespace {
 
@@ -80,6 +90,11 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 // read before its first download is all zeros (an "unknown register 0" crash at startup).
 // False when a speculative translation refused it (speculation-state.h): the packet applies nothing.
 [[nodiscard]] bool SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
+	// (A state pass syncs nothing off the GPU thread, and reads the table in a guarded copy, GuardTable: ~18% of the pass
+	// went here per table, the counters it shares with the GPU thread among it.)
+	// (KYTY_SPECULATE unset: a plain global, not the two thread-locals, on every indirect table.)
+	const bool speculating = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	if (speculating && Spec::Record() != nullptr) return true;
 	LiveCounters::Add(LiveCounters::IndirectTables);
 	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
@@ -90,8 +105,68 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 			     what, address, bytes);
 		}
 	}
+	if (!speculating) return true;
 	const auto* spec = Spec::Current();
 	return spec == nullptr || spec->refused == nullptr;
+}
+
+// Off the GPU thread (a speculation's translation or a state pass), an indirect register table read in one guarded
+// copy: the GPU thread may read-protect its pages after SyncCommandMemory looked (work it commits writes them), and a
+// fault there waits for the GPU thread, which may wait for this thread (the hang of 11-01 had that in a span read). A
+// fault refuses a speculation; a state pass applies nothing of the table (its chunks' start states then differ from
+// the GPU thread's, which the commit checks).
+//
+// The copy is also checked as a register table (`bank`: 0 context, 1 SH, 2 uconfig): an entry past its bank's registers
+// (not the sentinel, a context table's fake registers or the bank's NOP) is not one, and the table is not applied: the
+// speculation is refused, a state pass applies nothing of it (its start states then differ from the GPU thread's, which
+// the commit checks). The pass reads tables as they are (no command-memory sync off the GPU thread): one GPU work wrote
+// whose pages the GPU thread has not read-protected yet, or one the game has reused, may be other data. Such a table,
+// floats read as pairs, set DB_RENDER_CONTROL's copy-depth-to-color bit and ended a mode 4 run at the arch (11-01).
+// A state pass's register packet past its bank (a command buffer of other data): reported a few times.
+void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+		std::printf("Speculation: a state pass skipped a register packet of other data (header 0x%08x, register 0x%08x)\n",
+		            cmd_id, offset);
+}
+
+[[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank) {
+	if (GuestGpu::IsGpuThread()) {
+		// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
+		// thread wrote, local/write-guard.h.)
+		if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u))
+			table = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
+		return true;
+	}
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(size_t {pairs} * 2u);
+	// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page, through the backing view: the bytes the GPU thread wrote.)
+	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u)) {
+		std::memcpy(copy.data(), backing, uint64_t {pairs} * 8u);
+	} else if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
+		if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
+		return false;
+	}
+	for (uint32_t i = 0; i < pairs; ++i) {
+		const uint32_t raw = copy[size_t {i} * 2u];
+		if (raw == 0xffffffffu) continue;
+		const uint32_t offset = NormalizeRegisterOffset(raw);
+		const bool     known  = bank == 0   ? offset < Pm4::CX_NUM || HwCtxIsFakeRegister(offset)
+		                        : bank == 1 ? offset < Pm4::SH_NUM || offset == Pm4::SH_NOP
+		                                    : offset < Pm4::UC_NUM || offset == Pm4::UC_NOP;
+		if (!known) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+				std::printf("Speculation: an indirect register table at 0x%016llx not applied off the GPU thread: entry %u of %u "
+				            "names register 0x%08x, past its bank (%s)\n",
+				            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(table)), i, pairs, raw,
+				            bank == 0 ? "context" : bank == 1 ? "sh" : "uconfig");
+			if (Spec::Current() != nullptr) Spec::Refuse("indirect register table of other data");
+			return false;
+		}
+	}
+	table = copy.data();
+	return true;
 }
 
 // An entry of an indirect register table the emulator cannot apply: report the table once in a
@@ -1401,12 +1476,15 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			cp.ReportLodStats(dst, buffer_size, (buffer[3] & ((1u << 19) | (1u << 18))) != 0);
 			return 4;
 		}
+		// (A guest memory write of the emulator's: logged for the speculations that read it, upstream #288 F4.)
+		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), buffer_size);
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), buffer_size); // (KYTY_SCOUT: every emulator write)
 	}
 
 	return 4;
@@ -1886,6 +1964,14 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	return 5;
 }
 
+KYTY_CP_OP_PARSER(CpOpSuperResolution) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto body = KYTY_PM4_LEN(cmd_id) - 1;
+	cp.SuperResolution(buffer, body);
+	return body;
+}
+
 KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2011,6 +2097,236 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// KYTY_PM4_REGFILE (live 0..2, default 0; PR #285: faster on a Ryzen 5 7600, flat on an i9-14900K, slower on a Ryzen 7
+// 9700X): the indirect register tables (SET_*_REG_INDIRECT, ~252,100 values a frame at 1-1)
+// call a handler per value; 70 % of the values go to handlers that store the value into one context field (raw) or do
+// nothing (ign). The register file is the HW context already (no dirty bits), so 1 replaces those calls by the store
+// itself (or nothing), through a per-offset descriptor; the other handlers (dec, rmw, side, sgpr) are still called.
+// 2 = verify: the calls run, and each raw value's field must hold the value after its call (pm4_regfile_mismatch: 0).
+// Which handler is which is proved, not trusted: the candidates are the ign / raw lists below, and at the first packet
+// with the switch on each candidate's own handler runs on the
+// command processor's contexts from four base states (the live one, all zeros, all ones, a non-uniform fill) with two
+// complementary values: a raw one must change exactly the one aligned dword it
+// stores, to the value, in every run, an ign one nothing, and neither any byte of the command processor outside the
+// contexts; any other demotes it to its call (named in the engage line's report). The contexts are restored after.
+extern "C" {
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_pm4_regfile {0};
+}
+
+namespace Pm4Regfile {
+namespace {
+
+enum Kind : uint8_t { Call = 0, Ign = 1, Raw = 2 };
+enum Object : uint8_t { CtxObject = 0, ShObject = 1, UcObject = 2 };
+struct Desc {
+	uint32_t byte_off = 0;
+	uint8_t  kind     = Call;
+	uint8_t  object   = CtxObject;
+};
+Desc g_cx[Pm4::CX_NUM];
+Desc g_sh[Pm4::SH_NUM];
+Desc g_uc[Pm4::UC_NUM];
+bool g_ready = false; // (the GPU thread's: the descriptors are built once, at the first packet with the switch on)
+
+static_assert(std::is_trivially_copyable_v<HW::Context> && std::is_trivially_copyable_v<HW::Shader> &&
+              std::is_trivially_copyable_v<HW::UserConfig>);
+
+// The candidates: the handlers read as ign or raw (the rest stays a call whatever the probe says).
+void MarkCandidates() {
+	auto set = [](Desc* table, uint32_t size, uint32_t first, uint32_t last, uint32_t step, uint8_t kind) {
+		for (uint32_t off = first; off <= last && off < size; off += step) table[off].kind = kind;
+	};
+	auto cx = [&](uint8_t kind, std::initializer_list<uint32_t> regs) {
+		for (uint32_t r: regs) set(g_cx, Pm4::CX_NUM, r, r, 1, kind);
+	};
+	auto sh = [&](uint8_t kind, std::initializer_list<uint32_t> regs) {
+		for (uint32_t r: regs) set(g_sh, Pm4::SH_NUM, r, r, 1, kind);
+	};
+	auto uc = [&](uint8_t kind, std::initializer_list<uint32_t> regs) {
+		for (uint32_t r: regs) set(g_uc, Pm4::UC_NUM, r, r, 1, kind);
+	};
+	set(g_cx, Pm4::CX_NUM, Pm4::SPI_PS_INPUT_CNTL_0, Pm4::SPI_PS_INPUT_CNTL_31, 1, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::CB_COLOR0_CLEAR_WORD0, Pm4::CB_COLOR7_CLEAR_WORD0, 15, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::CB_COLOR0_CLEAR_WORD1, Pm4::CB_COLOR7_CLEAR_WORD1, 15, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_CL_VPORT_XSCALE, Pm4::PA_CL_VPORT_XSCALE_15, 6, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_CL_VPORT_XOFFSET, Pm4::PA_CL_VPORT_XOFFSET_15, 6, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_CL_VPORT_YSCALE, Pm4::PA_CL_VPORT_YSCALE_15, 6, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_CL_VPORT_YOFFSET, Pm4::PA_CL_VPORT_YOFFSET_15, 6, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_CL_VPORT_ZSCALE, Pm4::PA_CL_VPORT_ZSCALE_15, 6, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_CL_VPORT_ZOFFSET, Pm4::PA_CL_VPORT_ZOFFSET_15, 6, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_SC_VPORT_ZMIN_0, Pm4::PA_SC_VPORT_ZMIN_15, 2, Raw);
+	set(g_cx, Pm4::CX_NUM, Pm4::PA_SC_VPORT_ZMAX_0, Pm4::PA_SC_VPORT_ZMAX_15, 2, Raw);
+	cx(Raw, {Pm4::SPI_VS_OUT_CONFIG, Pm4::SPI_SHADER_POS_FORMAT, Pm4::SPI_SHADER_IDX_FORMAT, Pm4::PA_CL_VS_OUT_CNTL,
+	         Pm4::GE_NGG_SUBGRP_CNTL, Pm4::VGT_GS_INSTANCE_CNT, Pm4::VGT_GS_ONCHIP_CNTL, Pm4::VGT_HOS_MAX_TESS_LEVEL,
+	         Pm4::VGT_HOS_MIN_TESS_LEVEL, Pm4::GE_MAX_OUTPUT_PER_SUBGROUP, Pm4::VGT_ESGS_RING_ITEMSIZE,
+	         Pm4::VGT_GS_MAX_VERT_OUT, Pm4::VGT_PRIMITIVEID_EN, Pm4::VGT_REUSE_OFF, Pm4::VGT_MULTI_PRIM_IB_RESET_INDX,
+	         Pm4::VGT_TESS_DISTRIBUTION, Pm4::VGT_SHADER_STAGES_EN, Pm4::VGT_LS_HS_CONFIG, Pm4::VGT_GS_OUT_PRIM_TYPE,
+	         Pm4::VGT_TF_PARAM, Pm4::SPI_SHADER_Z_FORMAT, Pm4::SPI_PS_INPUT_ENA, Pm4::SPI_PS_INPUT_ADDR,
+	         Pm4::SPI_PS_IN_CONTROL, Pm4::SPI_BARYC_CNTL, Pm4::CB_SHADER_MASK, Pm4::PA_SC_SHADER_CONTROL,
+	         Pm4::CB_TARGET_MASK, Pm4::PA_CL_VTE_CNTL, Pm4::DB_DEPTH_CLEAR});
+	set(g_cx, Pm4::CX_NUM, Pm4::DB_SRESULTS_COMPARE_STATE0, Pm4::DB_SRESULTS_COMPARE_STATE1, 1, Ign);
+	cx(Ign, {Pm4::TA_BC_BASE_ADDR, Pm4::TA_BC_BASE_ADDR_HI, Pm4::PA_SU_POINT_SIZE, Pm4::PA_SU_POINT_MINMAX,
+	         Pm4::CB_DCC_CONTROL, Pm4::VGT_DRAW_PAYLOAD_CNTL, Pm4::VGT_PRIMITIVEID_RESET, Pm4::PA_CL_OBJPRIM_ID_CNTL,
+	         Pm4::PA_SC_FOV_WINDOW_LR, Pm4::PA_SC_FOV_WINDOW_TB, Pm4::PA_SC_FSR_ENABLE, Pm4::FSR_RECURSIONS0,
+	         Pm4::FSR_RECURSIONS1, Pm4::PA_SC_AA_MASK_X0Y0_X1Y0, Pm4::PA_SC_AA_MASK_X0Y1_X1Y1,
+	         Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK, Pm4::PA_SU_VTX_CNTL, Pm4::PA_SC_BINNER_CNTL_0,
+	         Pm4::PA_SC_BINNER_CNTL_1, Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, Pm4::DB_ALPHA_TO_MASK,
+	         Pm4::DB_COUNT_CONTROL, Pm4::DB_RENDER_OVERRIDE2, Pm4::DB_DFSM_CONTROL, Pm4::DB_RMI_L2_CACHE_CONTROL,
+	         Pm4::CB_RMI_GL2_CACHE_CONTROL});
+	sh(Ign, {Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS, Pm4::SPI_SHADER_PACE_ID_GS,
+	         Pm4::SPI_SHADER_PGM_RSRC4_GS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS, Pm4::SPI_SHADER_PGM_CHKSUM_HS,
+	         Pm4::SPI_SHADER_PGM_RSRC4_HS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS});
+	// (SetHsUserDataAddress merges one 32-bit half of the 64-bit address, one
+	// dword: a raw candidate, which the proof accepts or keeps as a call.)
+	sh(Raw, {Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS, Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS});
+	uc(Raw, {Pm4::VGT_OBJECT_ID, Pm4::GE_INDX_OFFSET, Pm4::GE_MULTI_PRIM_IB_RESET_EN});
+	uc(Ign, {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL, Pm4::IA_MULTI_VGT_PARAM,
+	         Pm4::TA_CS_BC_BASE_ADDR, Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION});
+}
+
+struct Probe {
+	uint8_t*             object[3];
+	size_t               size[3];
+	std::vector<uint8_t> live[3], after[3];
+	// The command processor's own bytes outside the three contexts: a candidate must not change them either.
+	const uint8_t*       cp_bytes = nullptr;
+	size_t               cp_size  = 0;
+	std::vector<uint8_t> cp_before;
+};
+
+// Whether [begin, end) of the command processor lies in one of the contexts.
+[[nodiscard]] bool InContexts(const Probe& p, size_t i) {
+	for (int o = 0; o < 3; ++o) {
+		const auto start = static_cast<size_t>(p.object[o] - p.cp_bytes);
+		if (i >= start && i < start + p.size[o]) return true;
+	}
+	return false;
+}
+
+// One candidate's handler from each base state with each value: its kind and field, or Call.
+template <class Func>
+Desc ProveOne(CommandProcessor& cp, Probe& p, Func func, uint32_t off, uint8_t claimed) {
+	constexpr uint32_t values[2] = {0xa5c30f1eu, 0x5a3cf0e1u};
+	Desc found {};
+	bool have = false;
+	for (int base = 0; base < 4; ++base) {
+		for (uint32_t value: values) {
+			for (int o = 0; o < 3; ++o) {
+				if (base == 0) std::memcpy(p.object[o], p.live[o].data(), p.size[o]);
+				else if (base == 3)
+					for (size_t i = 0; i < p.size[o]; ++i) p.object[o][i] = static_cast<uint8_t>(i * 0x9du + 0x5bu);
+				else std::memset(p.object[o], base == 1 ? 0x00 : 0xff, p.size[o]);
+				std::memcpy(p.after[o].data(), p.object[o], p.size[o]);
+			}
+			std::memcpy(p.cp_before.data(), p.cp_bytes, p.cp_size);
+			func(cp, off, value);
+			for (size_t i = 0; i < p.cp_size; ++i)
+				if (p.cp_bytes[i] != p.cp_before[i] && !InContexts(p, i)) return {};
+			int    changed_object = -1;
+			size_t first = SIZE_MAX, last = 0;
+			for (int o = 0; o < 3; ++o) {
+				if (std::memcmp(p.object[o], p.after[o].data(), p.size[o]) == 0) continue;
+				for (size_t i = 0; i < p.size[o]; ++i) {
+					if (p.object[o][i] == p.after[o][i]) continue;
+					if (changed_object != -1 && changed_object != o) return {};
+					changed_object = o;
+					first          = std::min(first, i);
+					last           = std::max(last, i);
+				}
+			}
+			if (claimed == Ign) {
+				if (changed_object != -1) return {};
+				continue;
+			}
+			// (Raw: the bytes that changed lie in one aligned dword, which now holds the value. A byte the value shares
+			// with the base does not change: the other value and the other bases see it. A run that changes nothing
+			// rejects it: a store of only some values, or only in some states, is no raw store; the bases other than the
+			// live one never hold either value, so only that one could, about once in 2^32: the register then stays a call.)
+			if (changed_object == -1) return {};
+			const auto window = static_cast<uint32_t>(first & ~size_t {3});
+			if (last >= window + 4u || window + 4u > p.size[changed_object] ||
+			    std::memcmp(p.object[changed_object] + window, &value, 4) != 0)
+				return {};
+			if (have && (found.object != changed_object || found.byte_off != window)) return {};
+			found = {window, Raw, static_cast<uint8_t>(changed_object)};
+			have  = true;
+		}
+	}
+	if (claimed == Ign) return {0, Ign, CtxObject};
+	return have ? found : Desc {};
+}
+
+void Build(CommandProcessor& cp, uint32_t mode) {
+	MarkCandidates();
+	Probe p {};
+	p.object[CtxObject] = reinterpret_cast<uint8_t*>(&cp.GetCtx());
+	p.object[ShObject]  = reinterpret_cast<uint8_t*>(&cp.GetShCtx());
+	p.object[UcObject]  = reinterpret_cast<uint8_t*>(&cp.GetUcfg());
+	p.size[CtxObject]   = sizeof(HW::Context);
+	p.size[ShObject]    = sizeof(HW::Shader);
+	p.size[UcObject]    = sizeof(HW::UserConfig);
+	for (int o = 0; o < 3; ++o) {
+		p.live[o].assign(p.object[o], p.object[o] + p.size[o]);
+		p.after[o].resize(p.size[o]);
+	}
+	p.cp_bytes = reinterpret_cast<const uint8_t*>(&cp);
+	p.cp_size  = sizeof(CommandProcessor);
+	p.cp_before.resize(p.cp_size);
+	uint32_t raw = 0, ign = 0, demoted = 0, candidates = 0;
+	char     report[512] = {};
+	size_t   used        = 0;
+	auto     prove       = [&](const char* space, Desc* table, uint32_t count, auto* funcs) {
+		for (uint32_t off = 0; off < count; ++off) {
+			const uint8_t claimed = table[off].kind;
+			if (claimed == Call) continue;
+			candidates++;
+			table[off] = funcs[off] != nullptr ? ProveOne(cp, p, funcs[off], off, claimed) : Desc {};
+			if (table[off].kind == Raw) raw++;
+			else if (table[off].kind == Ign) ign++;
+			else {
+				demoted++;
+				if (used + 16 < sizeof(report))
+					used += static_cast<size_t>(std::snprintf(report + used, sizeof(report) - used, " %s:0x%x", space, off));
+			}
+		}
+	};
+	prove("cx", g_cx, Pm4::CX_NUM, g_hw_ctx_indirect_func);
+	prove("sh", g_sh, Pm4::SH_NUM, g_hw_sh_indirect_func);
+	prove("uc", g_uc, Pm4::UC_NUM, g_hw_uc_indirect_func);
+	for (int o = 0; o < 3; ++o) std::memcpy(p.object[o], p.live[o].data(), p.size[o]);
+	std::printf("PM4 regfile: on (KYTY_PM4_REGFILE=%u: %u raw and %u ign registers of %u candidates, %u kept as calls%s%s)\n",
+	            mode, raw, ign, candidates, demoted, demoted != 0 ? ":" : "", report);
+	std::fflush(stdout);
+	g_ready = true;
+}
+
+// Per packet (the GPU thread): the switch, read once, and the descriptors built at its first use.
+[[nodiscard]] inline uint32_t Mode(CommandProcessor& cp) {
+	const uint32_t mode = kyty_local_pm4_regfile.load(std::memory_order_relaxed);
+	if (mode != 0 && !g_ready) Build(cp, mode);
+	return mode;
+}
+
+// The value at `off` (its descriptor `d`, not Call): stored (or nothing) in mode 1; called and checked in mode 2.
+template <class Func>
+inline void Apply(CommandProcessor& cp, uint8_t* const* base, const Desc& d, uint32_t mode, Func func, uint32_t off,
+                  uint32_t value, uint32_t& mismatches) {
+	if (mode == 1) {
+		if (d.kind == Raw) std::memcpy(base[d.object] + d.byte_off, &value, 4);
+		return;
+	}
+	func(cp, off, value);
+	if (d.kind == Raw && std::memcmp(base[d.object] + d.byte_off, &value, 4) != 0) mismatches++;
+}
+
+inline void Count(uint32_t fast, uint32_t mismatches) {
+	if (fast != 0) LiveCounters::Add(LiveCounters::Pm4RegfileFast, fast);
+	if (mismatches != 0) LiveCounters::Add(LiveCounters::Pm4RegfileMismatch, mismatches);
+}
+
+} // namespace
+} // namespace Pm4Regfile
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2031,6 +2347,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 0)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
+	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
+	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
+	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
+	uint32_t       rf_fast = 0, rf_mismatches = 0;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2071,8 +2393,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			continue;
 		}
 
+		if (rf_mode != 0) {
+			if (const auto& d = Pm4Regfile::g_cx[cmd_offset & (Pm4::CX_NUM - 1)]; d.kind != Pm4Regfile::Call) {
+				rf_fast++;
+				Pm4Regfile::Apply(cp, rf_base, d, rf_mode, pfunc, cmd_offset, value, rf_mismatches);
+				continue;
+			}
+		}
 		pfunc(cp, cmd_offset, value);
 	}
+	Pm4Regfile::Count(rf_fast, rf_mismatches);
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
@@ -2097,6 +2427,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
+	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
+	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
+	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
+	uint32_t       rf_fast = 0, rf_mismatches = 0;
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2113,8 +2449,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			continue;
 		}
 
+		if (rf_mode != 0) {
+			if (const auto& d = Pm4Regfile::g_sh[cmd_offset]; d.kind != Pm4Regfile::Call) {
+				rf_fast++;
+				Pm4Regfile::Apply(cp, rf_base, d, rf_mode, g_hw_sh_indirect_func[cmd_offset], cmd_offset, value,
+				                  rf_mismatches);
+				continue;
+			}
+		}
 		g_hw_sh_indirect_func[cmd_offset](cp, cmd_offset, value);
 	}
+	Pm4Regfile::Count(rf_fast, rf_mismatches);
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
@@ -2139,6 +2484,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 2)) return KYTY_PM4_LEN(cmd_id) - 1u;
+	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
+	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
+	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
+	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
+	uint32_t       rf_fast = 0, rf_mismatches = 0;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2158,8 +2509,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			ReportIndirectRegister("uc", indirect_address, indirect_num_dw, i, raw_cmd_offset, value);
 			continue;
 		}
+		if (rf_mode != 0) {
+			if (const auto& d = Pm4Regfile::g_uc[cmd_offset]; d.kind != Pm4Regfile::Call) {
+				rf_fast++;
+				Pm4Regfile::Apply(cp, rf_base, d, rf_mode, g_hw_uc_indirect_func[cmd_offset], cmd_offset, value,
+				                  rf_mismatches);
+				continue;
+			}
+		}
 		g_hw_uc_indirect_func[cmd_offset](cp, cmd_offset, value);
 	}
+	Pm4Regfile::Count(rf_fast, rf_mismatches);
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
@@ -2311,6 +2671,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
+			LiveCounters::Add(LiveCounters::GuestBarrierRelease);
 			cp.EmitGlobalBarrier();
 		}
 
@@ -2321,6 +2682,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
+			LiveCounters::Add(LiveCounters::GuestBarrierRelease);
 			cp.EmitGlobalBarrier();
 		}
 
@@ -2330,6 +2692,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	}
 
 	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
+		LiveCounters::Add(LiveCounters::GuestBarrierRelease);
 		cp.EmitGlobalBarrier();
 	}
 
@@ -2402,6 +2765,11 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 	}
 
 	if (cmd_offset >= Pm4::CX_NUM) {
+		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("unknown extended context register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 		     "\n\tcmd_offset = %08" PRIx32 "\n\tvalue = %08" PRIx32 "\n",
 		     num_dw - dw, cmd_id, cmd_offset, buffer[1]);
@@ -2446,7 +2814,17 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		return 2;
 	}
 
-	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	if (cmd_offset >= Pm4::SH_NUM) {
+		// (Off the GPU thread, a register packet past its bank is a command buffer of other data, one the game reused or GPU
+		// work wrote: the speculation is refused, a state pass skips it; its chunks' start states then differ, which the
+		// commit checks. A mode 4 run ended here during the arch's load, 11-01.)
+		if (!GuestGpu::IsGpuThread()) {
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
+		EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	}
 
 	auto pfunc = g_hw_sh_func[cmd_offset];
 
@@ -2499,6 +2877,11 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (cmd_offset >= Pm4::UC_NUM) {
+		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), cmd_id = 0x%08" PRIx32 "\n",
 		     cmd_offset, raw_cmd_offset, cmd_id);

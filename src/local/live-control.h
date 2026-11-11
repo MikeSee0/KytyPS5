@@ -1,7 +1,7 @@
 #pragma once
 // Local measurement hook (KYTY_LIVE_FILE): one boot, many same-process A/B experiments.
 // A side thread polls the command file every 100 ms and runs its commands once per new
-// "id N" first line, printing LIVE_* lines to stdout (tools/local/live-bench.py).
+// "id N" first line, printing LIVE_* lines to stdout (tools/local/bench-windows.py).
 //   poke32 <host address> <hex>   write a switch (live-bench resolves `sym NAME VALUE`)
 //   peek <host address> <bytes>   hex dump (<= 256 bytes)
 //   measure <seconds> <label>     presented frames, fps, per-frame CPU of the render and
@@ -16,20 +16,29 @@
 //   timecensus <seconds>          time-related HLE calls per guest caller (time-census.h)
 //   glide <x> <y> <z> <speed>     Demon's Souls 01.007.000: the player walks there (warp requests, no input)
 //   pad <lx> <ly> <rx> <ry> <buttons> <seconds>   scripted pad input (sticks 0..255, -1 the host's; buttons hex)
+//   screenshot <path>             the next frame shown, read back from the GPU, as a PPM file (screenshot.h)
+//   screenshots <path> <count>    the next <count> frames shown, 320 pixels wide, in one file (the flicker check)
+//   set <name> <value>            a live switch (live-switch.h), e.g. fsr_jitter_mode 1
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
 #include "common/assert.h"
 #include "frame-capture.h"
+#include "kernel/memory.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-trace.h"
 #include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "perf-overlay.h"
+#include "screenshot.h"
+#include "live-switch.h"
 #include "slow-log.h"
 #include "time-census.h"
+
+#include "SDL.h"
 
 #include <algorithm>
 #include <array>
@@ -435,9 +444,17 @@ inline void Run(uint64_t id, const std::string& line) {
 			LiveTrace::g_read_marks(std::min(LiveTrace::g_mark_next.load(), LiveTrace::MarkSlots));
 		LiveTrace::Dump(arg2);
 		const double seconds = std::chrono::duration<double>(clock1 - clock0).count();
-		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f path=%s\n", id,
+		// (The executable's load address: live-trace.py names the code addresses of the capture with it.)
+		uint64_t base = 0;
+#if defined(_WIN32)
+		if (!LocalPlatform::ModuleOf(reinterpret_cast<const void*>(&Flip), &base, nullptr, 0)) base = 0;
+#else
+		Dl_info self {};
+		if (dladdr(reinterpret_cast<void*>(&Flip), &self) != 0) base = reinterpret_cast<uint64_t>(self.dli_fbase);
+#endif
+		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f base=%016" PRIx64 " path=%s\n", id,
 		            std::min<uint64_t>(LiveTrace::g_count.load(), LiveTrace::Capacity),
-		            static_cast<double>(tsc1 - tsc0) / seconds, arg2);
+		            static_cast<double>(tsc1 - tsc0) / seconds, base, arg2);
 	} else if (cmd == "census" && n >= 2) {
 		// census <seconds>: render-thread time per call kind and shader over the window.
 		LiveCensus::g_on.store(false);
@@ -568,6 +585,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		// images <path>: the texture cache's images, one tab-separated row each (what the video memory holds).
 		if (LiveCounters::g_image_report != nullptr) LiveCounters::g_image_report(arg1);
 		std::printf("LIVE_IMAGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_image_report != nullptr ? 1 : 0);
+	} else if (cmd == "ranges" && n >= 2) {
+		// ranges <path>: the guest's virtual ranges with the names the game gave them (Memory::WriteGuestRanges).
+		const bool ok = Libs::LibKernel::Memory::WriteGuestRanges(arg1);
+		std::printf("LIVE_RANGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, ok ? 1 : 0);
 	} else if (cmd == "buffers" && n >= 2) {
 		// buffers <path>: the buffer cache's buffers, one tab-separated row each (what stays registered).
 		if (LiveCounters::g_buffer_report != nullptr) LiveCounters::g_buffer_report(arg1);
@@ -599,6 +620,23 @@ inline void Run(uint64_t id, const std::string& line) {
 		while (!text.empty() && (text.back() == '\r' || text.back() == ' ')) text.pop_back();
 		const bool ok = Loader::DemonsSoulsWarp::QueueCommand(text);
 		std::printf("LIVE_GAMECMD id=%" PRIu64 " queued=%d text=%s\n", id, ok ? 1 : 0, text.c_str());
+	} else if (cmd == "gamekill" && n >= 2) {
+		// gamekill <radius m>: the characters within it of the player die (loader/demonsSoulsWarp.h; log "Game kill: ...").
+		using Mode    = Loader::DemonsSoulsWarp::KillMode;
+		const auto mode = n == 3 && std::string_view(arg2) == "hp"      ? Mode::HpZero
+		                  : n == 3 && std::string_view(arg2) == "death" ? Mode::Death
+		                                                                : Mode::Suicide;
+		const bool ok   = Loader::DemonsSoulsWarp::QueueKill(std::strtof(arg1, nullptr), mode);
+		std::printf("LIVE_GAMEKILL id=%" PRIu64 " queued=%d radius=%s\n", id, ok ? 1 : 0, arg1);
+	} else if (cmd == "gamestrike" && n >= 2) {
+		// gamestrike <radius m>: the characters within it killed by the player's own (deadly) hits, nearest first; blocks
+		// until done (loader/demonsSoulsWarp.h).
+		const auto report = Loader::DemonsSoulsWarp::Strike(std::strtof(arg1, nullptr));
+		std::printf("LIVE_GAMESTRIKE id=%" PRIu64 " %s\n", id, report.c_str());
+	} else if (cmd == "gamesweep" && n >= 2) {
+		// gamesweep <seconds> [radius m]: the nearest living character killed, again and again (loader/demonsSoulsWarp.h).
+		const auto report = Loader::DemonsSoulsWarp::Sweep(std::strtod(arg1, nullptr), n == 3 ? std::strtof(arg2, nullptr) : 1000.0f);
+		std::printf("LIVE_GAMESWEEP id=%" PRIu64 " %s\n", id, report.c_str());
 	} else if (cmd == "warp" && n >= 2) {
 		// warp <map> <spawn> | warp off: the debug warp (loader/demonsSoulsWarp.h).
 		const bool off = std::string_view(arg1) == "off";
@@ -606,6 +644,11 @@ inline void Run(uint64_t id, const std::string& line) {
 		                     : n == 3 && Loader::DemonsSoulsWarp::Arm(arg1, arg2);
 		std::printf("LIVE_WARP id=%" PRIu64 " map=%s spawn=%s ok=%d spawns=%zu\n", id, arg1, n == 3 ? arg2 : "-",
 		            ok ? 1 : 0, Loader::DemonsSoulsWarp::Spawns().size());
+	} else if (cmd == "mode" && n >= 2) {
+		// mode 0|4: KYTY_SPECULATE's mode changed live, between submissions (mode-toggle.h); the reply comes when it is
+		// asked for, the log's "Mode: KYTY_SPECULATE=N (live)" when it is applied.
+		ModeToggle::Request(std::atoi(arg1) == 4 ? 4 : 0);
+		std::printf("LIVE_MODE id=%" PRIu64 " requested=%d\n", id, std::atoi(arg1) == 4 ? 4 : 0);
 	} else if (cmd == "glide") {
 		// glide X Y Z SPEED: the player walked there in a straight line (loader/demonsSoulsWarp.h), at once; seconds = the
 		// time it takes (-1: no player).
@@ -625,8 +668,37 @@ inline void Run(uint64_t id, const std::string& line) {
 	} else if (cmd == "fatal") {
 		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
 		EXIT("live fatal: a test of the fatal-error exit\n");
+	} else if (cmd == "screenshot" && n >= 2) {
+		// screenshot <path>: the next frame shown, as a PPM file (screenshot.h; "SCREENSHOT <path>" once written).
+		Libs::Graphics::Screenshot::Request(arg1);
+		std::printf("LIVE_SCREENSHOT id=%" PRIu64 " path=%s\n", id, arg1);
+	} else if (cmd == "screenshots" && n >= 3) {
+		// screenshots <path> <count>: the next frames shown, small, in one file (screenshot.h, the flicker check).
+		Libs::Graphics::Screenshot::RequestSeries(arg1, static_cast<uint32_t>(std::strtoul(arg2, nullptr, 10)));
+		std::printf("LIVE_SCREENSHOTS id=%" PRIu64 " path=%s count=%s\n", id, arg1, arg2);
+	} else if (cmd == "set" && n >= 3) {
+		// set <name> <value>: a live switch (live-switch.h).
+		const bool ok = LiveSwitch::Set(arg1, std::strtoll(arg2, nullptr, 10));
+		std::printf("LIVE_SET id=%" PRIu64 " %s=%s ok=%d\n", id, arg1, arg2, ok ? 1 : 0);
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
+	} else if (cmd == "key" && n >= 2) {
+		// key <SDL key name> [seconds]: a key typed into the game window, as SDL events pushed on its queue (no window
+		// focus needed), e.g. `key F11`.
+		const SDL_Keycode code = SDL_GetKeyFromName(arg1);
+		if (code != SDLK_UNKNOWN) {
+			SDL_Event event {};
+			event.type                = SDL_KEYDOWN;
+			event.key.state           = SDL_PRESSED;
+			event.key.keysym.sym      = code;
+			event.key.keysym.scancode = SDL_GetScancodeFromKey(code);
+			SDL_PushEvent(&event);
+			std::this_thread::sleep_for(std::chrono::duration<double>(n >= 3 ? std::strtod(arg2, nullptr) : 0.1));
+			event.type      = SDL_KEYUP;
+			event.key.state = SDL_RELEASED;
+			SDL_PushEvent(&event);
+		}
+		std::printf("LIVE_KEY id=%" PRIu64 " key=%s ok=%d\n", id, arg1, code != SDLK_UNKNOWN ? 1 : 0);
 	} else if (cmd == "capture" && n >= 2) {
 		// capture <dir> [frames] [hash,hash,...]: every draw/dispatch of the next frames, with
 		// the constants of the listed shaders (frame-capture.h).

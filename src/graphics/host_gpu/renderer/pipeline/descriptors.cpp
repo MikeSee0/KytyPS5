@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "frame-gen.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -47,7 +48,7 @@
 #endif
 
 extern "C" {
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {0};
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {1};
 }
 
 namespace Libs::Graphics {
@@ -522,8 +523,10 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 // The guest texture of the levels `first`.. of `full`, its larger levels left out: the tiled layout puts the mip tail
 // first and then the levels from the smallest up, so a 2D texture's levels from `first` on are the first bytes of its
-// memory, laid out as the texture of its size >> first with that many fewer levels. False where that does not hold
-// byte for byte (every level's offset, size and padding is compared).
+// memory, laid out as the texture of its size >> first with that many fewer levels. An array's layers lie one after
+// another, each with all its levels (TextureCalcUploadLayout's slice stride, the data's size over the layers): the
+// smaller array keeps the whole memory, so that stride stays, each layer's kept levels the first bytes of its own.
+// False where that does not hold byte for byte (every level's offset, size and padding is compared).
 static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& out) {
 	if (first == 0 || first >= full.resources.levels || full.resources.levels > full.mip_layout.size()) return false;
 	const auto shift = [&](uint32_t value) { return std::max((value + (1u << first) - 1u) >> first, 1u); };
@@ -547,7 +550,9 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 	    size.size == 0 || size.size >= full.data.size || size.align == 0 || full.data.address % size.align != 0) {
 		return false;
 	}
-	out.data       = {full.data.address, size.size};
+	const auto layers = full.resources.layers;
+	if (layers > 1 && (full.data.size % layers != 0 || size.size > full.data.size / layers)) return false;
+	out.data       = {full.data.address, layers > 1 ? full.data.size : size.size};
 	out.mip_layout = {};
 	PopulateTextureMipLayout(out);
 	for (uint32_t level = 0; level < out.resources.levels; ++level) {
@@ -563,24 +568,31 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 // were never sampled from level 0, their larger levels 1.7 GB of the 3.9 GB the textures took, on a card holding 10 GB
 // in its 7.3 GB budget. An image of the whole texture, or of the texture from a lower level, serves the view as before;
 // when the game samples a larger level, the lookup makes the texture from that level (or the whole), and the smaller
-// image goes unused (a new image over its memory ends the resolution cache's hold on it).
+// image goes unused (a new image over its memory ends the resolution cache's hold on it). On with FSR frame generation
+// too (KYTY_FRAMEGEN_BACKEND=fsr): its allocations take about the video memory these levels give back, and none of
+// them is a level the game samples.
 static bool TexturePrefixEnabled(bool small_video_memory) {
 	static const char* const value = std::getenv("KYTY_TEXTURE_PREFIX");
-	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory || FrameGen::UsesFsr();
 }
 
-// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 with less than 12 GiB of video memory, else 0): a sampled 2D block-compressed
+// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 on a card of 12 GiB of video memory or less, else 0:
+// GraphicContext::reduce_texture_levels): a sampled 2D block-compressed
 // texture of at least 1024 texels on a side is held without its 1 or 2 largest levels, as a T# from that level would be
 // (TextureFromLevel): its kept levels are the first bytes of its memory, so the left-out ones take no video memory and
 // are not uploaded when the game writes them. One level left out is a quarter of the texture: at 1-1 its BC textures
-// took 3.7 GiB (0.9 reduced), on cards whose budget held about 10 of the 11 GB the level wanted. Shaders sample the
-// smaller texture (half the texels across); size queries, explicit levels and texel loads see it too (a little blur).
-static uint32_t TextureReduceLevels(bool small_video_memory) {
+// took 3.7 GiB (0.9 reduced), on cards whose budget held about 10 of the 11 GB the level wanted. Arrays too, each
+// layer's kept levels the first bytes of its own (the game's writes to the left-out ones then count as the array's: its
+// range takes them in): the texture pools' 1024x1024 arrays at 1-1 (256 and 64 layers) took 470 of the 1,313 MiB left
+// with one level out. Shaders sample the smaller texture (half the texels across); size queries, explicit levels and
+// texel loads see it too (a little blur). Demon's Souls streams none of the levels left out into its memory either
+// (loader/demonsSoulsTextureMips.cpp).
+uint32_t TextureReduceLevels(bool reduce_texture_levels) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'
 		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
-		                            : (small_video_memory ? 1u : 0u);
+		                            : (reduce_texture_levels ? 1u : 0u);
 		if (chosen != 0) {
 			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
 			            "(KYTY_TEXTURE_REDUCE=0 keeps them whole)\n",
@@ -592,13 +604,13 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 	return levels;
 }
 
-static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, const GraphicContext& graphics) {
 	const auto  base = desc.view_info.base_level;
 	const auto  last = base + desc.view_info.level_count - 1u;
 	const auto& full = desc.info;
 	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
 	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
-	const auto reduce = TextureReduceLevels(small_video_memory);
+	const auto reduce = TextureReduceLevels(graphics.reduce_texture_levels);
 	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= 1024u &&
 	                          full.resources.levels > reduce && last >= reduce &&
 	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
@@ -607,11 +619,12 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	                        : 0u;
 	// The first level held: the T#'s base, or past the levels left out.
 	const auto first_held = std::max(base, drop);
-	if (first_held == 0 || (drop == 0 && !TexturePrefixEnabled(small_video_memory)) || full.resources.layers != 1 ||
-	    full.samples != 1 || full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() ||
-	    full.HasMetadata() || full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
-	    full.tile_mode == Prospero::TileMode::kDepth || full.tile_mode == Prospero::TileMode::kRenderTarget ||
-	    cache.HoldsImage(full)) {
+	// (An array only for the levels left out: one held from its T#'s later base level is not tried.)
+	if (first_held == 0 || (drop == 0 && (!TexturePrefixEnabled(graphics.small_video_memory) || full.resources.layers > 1)) ||
+	    full.resources.layers == 0 || full.samples != 1 || full.type != Prospero::ImageType::kColor2D ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() ||
+	    full.tile_mode == Prospero::TileMode::kLinear || full.tile_mode == Prospero::TileMode::kDepth ||
+	    full.tile_mode == Prospero::TileMode::kRenderTarget || cache.HoldsImage(full)) {
 		return;
 	}
 	ImageInfo from {};
@@ -692,6 +705,18 @@ static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, u
 	desc.view_info.base_layer = held_first;
 }
 
+// A sampled array's view: its layers from the base, no more than the shader can reach (ImageResource::max_array_index).
+// The texture-pool views of 1-1 and Stonefang read 256 of up to 2,255 layers; held whole they were images of up to
+// 1 GiB, uploaded in seconds (issue #174, an 8 GB card that then lost the device). KYTY_TEXTURE_LAYER_BOUND=0: every
+// layer to the T#'s last, as before.
+static uint32_t ArrayViewLayers(const ShaderRecompiler::IR::ImageResource& resource, uint32_t layers) {
+	static const bool bound = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_LAYER_BOUND");
+		return value == nullptr || value[0] != '0';
+	}();
+	return bound && resource.max_array_index < layers ? resource.max_array_index + 1u : layers;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -721,7 +746,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -735,7 +760,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
@@ -1042,10 +1067,11 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (size.size >= (uint64_t {1} << 30u)) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
-			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u "
+			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u view_layers=%u "
 			            "fmt=%u tile=%u type=%u storage=%d pc=0x%x dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
 			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size), width, height,
-			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), static_cast<uint32_t>(format),
+			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), desc.view_info.layer_count,
+			            static_cast<uint32_t>(format),
 			            static_cast<uint32_t>(tile), static_cast<uint32_t>(type), storage ? 1 : 0, resource.first_use_pc,
 			            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
 			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
@@ -1053,8 +1079,8 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		}
 	}
 
-	if (!storage && type == Prospero::ImageType::kColor2D) {
-		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
+	if (!storage && (type == Prospero::ImageType::kColor2D || type == Prospero::ImageType::kColor2DArray)) {
+		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics());
 	}
 	// KYTY_TEST_MAX_ARRAY_LAYERS=<n>: textures held as if the GPU's images held no more than n layers. 2048 = NVIDIA's: an
 	// AMD GPU (8192) then binds the texture-pool views past it null as NVIDIA does (issue #24: a picture broken on AMD
@@ -1072,8 +1098,10 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		                             width, height, desc.info.resources.layers, levels, static_cast<uint32_t>(format),
 		                             descriptor.BaseArray5(), address));
 	}
-	// (A sampled texture the GPU cannot make, its memory full: a null image, not the end of the emulator.)
-	auto id = texture_cache.FindImage(desc, shader_conversion, !storage);
+	// (A texture or storage image the GPU cannot make, its memory full: a null image, not the end of the emulator; a
+	// storage view loses its writes until the collector made room. Issue #53: a 320x180x61 storage image of the cinematic
+	// mode on a 16 GB RX 7800 XT whose video memory the 4K targets had filled.)
+	auto id = texture_cache.FindImage(desc, shader_conversion, true);
 	if (!id) {
 		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
 		                             "addr=0x{:016x} size=0x{:x}",
@@ -1102,10 +1130,19 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	return {id, nullptr, std::move(desc)};
 }
 
+// Whether the program's samplers are the materials' (UpscaleBiasApplies: the color targets a pixel shader writes). Its
+// own function: a branch in PrepareBindingsInto would cost that hot path its PGO profile.
+[[gnu::noinline]] static bool MaterialSamplers(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	uint32_t targets = 0;
+	for (const auto& output: program.info.outputs)
+		targets += output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ? 1u : 0u;
+	return UpscaleBiasApplies(program.stage == ShaderType::Pixel, targets);
+}
+
 static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 const ShaderRecompiler::IR::DescriptorValue& value, bool material) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
@@ -1113,7 +1150,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	return context.GetSamplerCache().GetSampler(descriptor, material);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -1197,8 +1234,9 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 		prepared.images.push_back(std::move(binding));
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
+	const bool material = MaterialSamplers(program);
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i], material));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
@@ -1366,6 +1404,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+// A dynamic storage binding's levels and the level of its view `mip`: a null image's (bind_null: no image could be made,
+// issue #53) one level stands for each level the shader picks. (Out of AcquireImages, whose control flow and so its PGO
+// profile stay as they were.)
+[[gnu::noinline]] static uint32_t DynamicStorageLevels(const TextureBinding& binding, uint32_t mip_count) {
+	return binding.desc.info.data.Empty() ? mip_count : binding.desc.view_info.level_count;
+}
+[[gnu::noinline]] static uint32_t DynamicStorageLevel(const TextureBinding& binding, uint32_t mip) {
+	return binding.desc.info.data.Empty() ? 0u : mip;
+}
+
 bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 	const auto& program       = *prepared.runtime->program;
 	auto&       images        = prepared.images;
@@ -1378,11 +1426,11 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
 			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			        resource.mip_count != DynamicStorageLevels(binding, resource.mip_count));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				desc.view_info.base_level += DynamicStorageLevel(binding, mip);
 				desc.view_info.level_count = 1;
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
@@ -1587,8 +1635,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
+				// A draw's shader reads the image it writes (the deferred decals' G-buffer): ordered after the last
+				// draw's write with KYTY_DRAW_READ_AFTER_WRITE=1 (Image::GetBarriers, issue #315). A dispatch is
+				// ordered by the game's own barriers.
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer,
+				              image.binding.shader_write && pipeline_bind_point == vk::PipelineBindPoint::eGraphics);
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,

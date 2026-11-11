@@ -6,8 +6,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -27,9 +27,6 @@ enum class MemoryUsage : uint8_t {
 	Upload,
 	Download,
 	Stream,
-	// Video memory bound page by page as it is used (Buffer::MakeResident); a page with none reads zero and drops writes
-	// (GraphicContext::sparse_residency_buffers).
-	SparseDeviceLocal,
 };
 
 inline constexpr vk::BufferUsageFlags ReadFlags =
@@ -44,8 +41,17 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A game buffer bound to `allocation` (a defragmentation pass's destination: BufferCache::Defragment).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
+	       uint64_t size, VmaAllocation allocation);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
+
+	[[nodiscard]] VmaAllocation Allocation() const noexcept { return m_allocation; }
+	// Defragmentation: the allocation it is destroyed without (a moved buffer's memory, which the pass frees), and the
+	// one it takes (the moved allocation, now at its memory).
+	void                        ReleaseAllocation() noexcept { m_allocation = nullptr; }
+	void                        AdoptAllocation(VmaAllocation allocation) noexcept { m_allocation = allocation; }
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
@@ -80,15 +86,14 @@ public:
 	void CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset, uint64_t destination_offset,
 	               uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
-	// MemoryUsage::SparseDeviceLocal: binds video memory to the pages of [offset, offset + size) without any and zeroes
-	// them (a fill recorded in the current command buffer, whose submission waits for the binding on the GPU:
-	// CommandScheduler::WaitBeforeNextSubmit). Other buffers: nothing.
-	void MakeResident(uint64_t offset, uint64_t size);
 
 	// BufferCache state lives directly on the resource (is_deleted also read by a speculative translation's thread).
 	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The flip of its last use (BufferCache::TouchBuffer: bound, or read through pointers from its pages,
+	// EnsureBdaReadable), not the stale-buffer retirement's pass over it.
+	mutable uint64_t used_tick = 0;
 	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no
 	// LRU entry, so the stale-buffer retirement passes it over (BufferCache::RunGarbageCollector).
 	bool bda_read = false;
@@ -117,8 +122,6 @@ private:
 	bool                          m_coherent = false;
 	bool                          m_in_system_memory = false;
 	std::span<uint8_t>            m_mapped;
-	struct Sparse;
-	std::unique_ptr<Sparse> m_sparse;
 };
 
 class StreamBuffer final: public Buffer {
@@ -130,6 +133,9 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// KYTY_STAGING_STATS: an upload the caller sends around the ring (a temporary buffer, the
+	// large path), counted with its use.
+	void NoteBypass(uint64_t size);
 	// What was fenced with `pending` (a speculative translation's work: CommandScheduler::PendingTick and up) gets
 	// `tick`.
 	void ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept;
@@ -149,6 +155,21 @@ private:
 	                                                uint64_t requested_upper_bound, bool allow_wait,
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
+	// KYTY_STAGING_STATS=1 (diagnostics): an upload ring's use, printed each 10 s (Map): the bytes
+	// through it, its laps, the waits for the GPU, the most in flight (reserved and not yet read
+	// by the GPU: the size it needs), the reservations refused (too large, or a wait not allowed)
+	// and the uploads sent around it.
+	struct UseStats {
+		uint64_t bytes = 0, maps = 0, laps = 0, waits = 0, wait_us = 0, largest = 0;
+		uint64_t second_bytes = 0, busiest = 0, in_flight = 0;
+		uint64_t refused = 0, refused_bytes = 0, bypassed = 0, bypassed_bytes = 0;
+		std::chrono::steady_clock::time_point since {}, second {};
+	};
+	[[nodiscard]] uint64_t InFlight();
+	void                   NoteUse(uint64_t size, bool wrap);
+	void                   NoteRefusal(uint64_t size);
+
+	UseStats              m_use;
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;
@@ -158,6 +179,11 @@ private:
 	size_t                m_wait_cursor = 0;
 	uint64_t              m_wait_bound  = 0;
 };
+
+// The buffer reclaimer frees no memory from HoldBufferFrees (false: a free runs now) to ReleaseBufferFrees: a defragmentation
+// pass's moves must stay allocated until it ends (BufferCache::Defragment; streamBuffer.cpp).
+[[nodiscard]] bool HoldBufferFrees();
+void               ReleaseBufferFrees();
 
 } // namespace Libs::Graphics
 

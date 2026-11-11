@@ -17,10 +17,17 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsPageFree.h"
+#include "loader/demonsSoulsLanguages.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
+#include "loader/demonsSoulsHdOutput.h"
+#include "loader/demonsSoulsSuperResolution.h"
+#include "loader/demonsSoulsLoaderGuard.h"
+#include "loader/demonsSoulsTextureMips.h"
+#include "loader/demonsSoulsEnginePools.h"
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -29,6 +36,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <atomic>
@@ -416,9 +424,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "pushq %%r15\n\t"
 		             "movq %%gs:0x08, %%r14\n\t"
 		             "movq %%gs:0x10, %%r15\n\t"
-		             "xorq %%rcx, %%rcx\n\t"
-		             "movq %%rcx, %%gs:0x08\n\t"
-		             "movq %%rcx, %%gs:0x10\n\t"
+		             KYTY_GUEST_TEB_STACK_RANGE_ASM("10")
 		             "movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
 		             "movq %[guest_rsp], %%rsp\n\t"
@@ -857,6 +863,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// A page a pending guest write of the command processor guards (KYTY_WRITE_GUARD): waits for its lift.
+		if (WriteGuard::OnFault(info->access_violation_vaddr, info->exception_address)) return true;
 		// Live trace: which guest code touches tracked pages (a readback or an invalidation follows).
 		LiveTrace::Event(LiveTrace::FaultSite, info->exception_address,
 		                 info->access_violation_vaddr | (access == GpuAccess::Write ? uint64_t {1} << 63u : 0));
@@ -1618,11 +1626,19 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsPageFree::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	// (The PS5 Pro path first: with the HD output too, that takes only the interface's part.)
+	DemonsSoulsSuperResolution::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsHdOutput::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsLoaderGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsTextureMips::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsEnginePools::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsLanguages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1647,6 +1663,7 @@ void RuntimeLinker::Clear() {
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
 	DemonsSoulsIdle::Clear();
+	DemonsSoulsPageFree::Clear();
 	DemonsSoulsCopy::Clear();
 	DemonsSoulsGpuPages::Clear();
 

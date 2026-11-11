@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "live-switch.h"
 #include "slow-log.h"
 
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -13,6 +14,7 @@
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -57,16 +59,31 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 // HasReadWatchers' filter: a bit per 64 KiB granule.
 constexpr uint64_t READ_GRANULE_SIZE  = 64 * 1024;
 constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
+// The lowest 64 KiB of the address space: never guest memory (UpdateRegionWatchers).
+constexpr size_t NULL_PAGES = 64 * 1024 / PAGE_SIZE;
 
 constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
 constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
+
+// The raw return addresses of a fatal end, on stderr (resolve them with the build's map: the end itself names no
+// caller; 10-18 a 1-1 tour ended on "invalid range vaddr=0, size=0x400000" with nothing else).
+void WriteBacktrace() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void*      frames[32];
+	const auto count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+	std::fprintf(stderr, "--- Backtrace --- (exe base %p)\n", static_cast<void*>(GetModuleHandleW(nullptr)));
+	for (USHORT i = 0; i < count; ++i) std::fprintf(stderr, "  %p\n", frames[i]);
+	std::fflush(stderr);
+#endif
+}
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	WriteBacktrace();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 #endif
@@ -81,6 +98,7 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 	va_end(args);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	WriteBacktrace();
 	std::_Exit(322);
 }
 
@@ -193,7 +211,18 @@ struct PageManager::Impl {
 		std::array<PageState, REGION_PAGES> pages;
 		// Nonzero while a page has read watchers (HasReadWatchers).
 		std::array<std::atomic<uint8_t>, REGION_PAGES> read_hint {};
+		// The texture offload's holds of a page (src/local/texture-offload.h: its guest bytes dropped from RAM): no access
+		// while any lasts, whatever its watchers. A count of its own: as a read watcher it took the one read bit a page
+		// has, and the GPU's tracking of a GPU write over such a texture's memory (a pool reused while a level loads)
+		// ended the emulator with "read-watcher overflow" (issue #91, an RTX 3050 with 16 GB of RAM). (Atomic: WatchedRuns
+		// reads without the lock.)
+		std::array<std::atomic<uint8_t>, REGION_PAGES> offload {};
 	};
+
+	// A page's protection: its watchers', no access while the offload holds it.
+	static uint32_t PermsOf(const Region& region, size_t page) noexcept {
+		return region.offload[page].load(std::memory_order_relaxed) != 0 ? NO_ACCESS_PROTECTION : region.pages[page].Perms();
+	}
 
 	Impl() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -223,8 +252,8 @@ struct PageManager::Impl {
 	~Impl() {
 		for (const auto& region: region_storage) {
 			SpinGuard lock(region->lock);
-			for (auto& page: region->pages) {
-				if (page.write_watchers != 0 || page.access_watchers != 0) {
+			for (size_t page = 0; page < REGION_PAGES; page++) {
+				if (PermsOf(*region, page) != READ_WRITE_PROTECTION) {
 					FailFast("PageManager destroyed with live page state");
 				}
 			}
@@ -260,17 +289,32 @@ struct PageManager::Impl {
 		}
 	}
 
+	// The deferred read protections' no access, by minor mode where the platform can (VirtualMemory::ZapNoAccess:
+	// Linux, KYTY_UFFD_MINOR; live switch uffd_minor, 0: mprotect for the protections made from then on).
+	struct ZapScope {
+		ZapScope() noexcept {
+			static auto& zap = LiveSwitch::Find("uffd_minor", 1);
+			Common::VirtualMemory::ZapNoAccess(zap.load(std::memory_order_relaxed) != 0);
+		}
+		~ZapScope() { Common::VirtualMemory::ZapNoAccess(false); }
+	};
+
 	static void FlushReadProtect() noexcept {
+		if (g_read_protects.empty()) return;
+		ZapScope zap;
 		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
 		g_read_protects.clear();
 	}
 
 	// The pending no-access ranges that overlap [begin, end), applied first (a protection change of those pages
-	// comes after them; pages of the others keep theirs pending).
-	static void FlushReadProtectOverlapping(uint64_t begin, uint64_t end) noexcept {
+	// comes after them; pages of the others keep theirs pending). Not zapped for the texture offload's hold (`zap`
+	// false): it then frees the pages, and a hole's access would not fault.
+	static void FlushReadProtectOverlapping(uint64_t begin, uint64_t end, bool zap = true) noexcept {
 		auto& ranges = g_read_protects;
 		for (size_t i = 0; i < ranges.size();) {
 			if (ranges[i].begin < end && begin < ranges[i].end) {
+				std::optional<ZapScope> zapping;
+				if (zap) zapping.emplace();
 				ProtectHost(ranges[i].begin, ranges[i].end - ranges[i].begin, NO_ACCESS_PROTECTION);
 				ranges[i] = ranges.back();
 				ranges.pop_back();
@@ -317,18 +361,33 @@ struct PageManager::Impl {
 		ProtectHost(vaddr, size, protection);
 	}
 
-	template <bool track, bool is_read, bool masked>
+	template <bool track, bool is_read, bool masked, bool offload = false, bool reapply = false>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
+		// The lowest 64 KiB hold no guest memory (no mapping is ever made there): a range a stale descriptor put there
+		// is not watched, both ways alike. Watched, the deferred write protection of its region's first pages started
+		// at address 0, an invalid range, and the upload worker's protection job ended the emulator ("invalid range
+		// vaddr=0x0, size=0x400000", issue #70 and a 1-1 tour, both with DLSS super resolution on).
+		if (base_addr == 0 && first < NULL_PAGES) {
+			static std::atomic<bool> reported {false};
+			if (!reported.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Page watchers: pages below 64 KiB (%s 0x%llx-0x%llx) left unwatched: no guest memory there\n",
+				            is_read ? "read" : "write", static_cast<unsigned long long>(first * PAGE_SIZE),
+				            static_cast<unsigned long long>(last * PAGE_SIZE));
+				std::fflush(stdout);
+			}
+			first = NULL_PAGES;
+			if (first >= last) return;
+		}
 		SpinGuard lock(region.lock);
-		auto      perms                 = region.pages[first].Perms();
+		auto      perms                 = PermsOf(region, first);
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				if (track && !is_read && g_deferred_write_protect != nullptr) {
+				if (track && !is_read && !offload && g_deferred_write_protect != nullptr) {
 					g_deferred_write_protect->push_back({base_addr + range_begin * PAGE_SIZE, range_bytes});
 				} else {
 					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
@@ -343,13 +402,25 @@ struct PageManager::Impl {
 			const auto address = base_addr + page_index * PAGE_SIZE;
 			const bool update  = !masked || mask->Get(page_index);
 
-			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
-			                              : page.AddDelta<0, is_read>(address);
-			const auto new_perms = page.Perms();
-			if constexpr (is_read) {
-				if (new_count != 0) MarkReadGranule(address); // (before the page's hint: the bits stay a superset)
-				region.read_hint[page_index].store(new_count != 0, std::memory_order_release);
+			const auto old_perms = PermsOf(region, page_index);
+			uint32_t   new_count = 0;
+			if constexpr (offload) {
+				auto& holds = region.offload[page_index];
+				new_count   = holds.load(std::memory_order_relaxed);
+				if (update) {
+					if (new_count == (track ? 255u : 0u)) Fatal("offload-hold %s at 0x%016" PRIx64, track ? "overflow" : "underflow", address);
+					new_count += track ? 1 : -1;
+					holds.store(static_cast<uint8_t>(new_count), std::memory_order_relaxed);
+				}
+			} else {
+				new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address) : page.AddDelta<0, is_read>(address);
+			}
+			const auto new_perms = PermsOf(region, page_index);
+			if constexpr (is_read || offload) {
+				// (A page the offload holds is read-watched to HasReadWatchers: a read of it faults.)
+				const bool faults = new_perms == NO_ACCESS_PROTECTION;
+				if (faults) MarkReadGranule(address); // (before the page's hint: the bits stay a superset)
+				region.read_hint[page_index].store(faults, std::memory_order_release);
 			}
 
 			if (new_perms != perms) [[unlikely]] {
@@ -364,7 +435,7 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
-			if (watcher_edge && old_perms != new_perms) {
+			if (reapply || (watcher_edge && old_perms != new_perms)) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
 					potential_range_bytes = PAGE_SIZE;
@@ -374,7 +445,7 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
-		if constexpr (is_read) SyncReadGranules(region, base_addr, first, last);
+		if constexpr (is_read || offload) SyncReadGranules(region, base_addr, first, last);
 	}
 
 	// A bit per 64 KiB granule: some page there may have read watchers. Set before a page's read_hint, cleared after
@@ -421,9 +492,9 @@ struct PageManager::Impl {
 				SpinGuard lock(region->lock);
 				const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
 				for (auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE); first < last;) {
-					const auto perms = region->pages[first].Perms();
+					const auto perms = PermsOf(*region, first);
 					auto       next  = first + 1;
-					while (next < last && region->pages[next].Perms() == perms) next++;
+					while (next < last && PermsOf(*region, next) == perms) next++;
 					Protect(region_base + first * PAGE_SIZE, (next - first) * PAGE_SIZE, perms);
 					first = next;
 				}
@@ -442,9 +513,9 @@ struct PageManager::Impl {
 			if (const auto* region = FindRegion(chunk_begin); region != nullptr) {
 				const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
 				for (auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE); first < last;) {
-					const auto perms = region->pages[first].Perms();
+					const auto perms = PermsOf(*region, first);
 					auto       next  = first + 1;
-					while (next < last && region->pages[next].Perms() == perms) next++;
+					while (next < last && PermsOf(*region, next) == perms) next++;
 					if (perms != READ_WRITE_PROTECTION) {
 						const auto address = region_base + first * PAGE_SIZE;
 						const auto mode    = ToMemoryMode(perms);
@@ -472,9 +543,9 @@ struct PageManager::Impl {
 				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
 				for (auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 				     first < last;) {
-					const auto perms = region->pages[first].Perms();
+					const auto perms = PermsOf(*region, first);
 					auto       next  = first + 1;
-					while (next < last && region->pages[next].Perms() == perms) next++;
+					while (next < last && PermsOf(*region, next) == perms) next++;
 					if (perms != READ_WRITE_PROTECTION) {
 						Protect(region_base + first * PAGE_SIZE, (next - first) * PAGE_SIZE, perms);
 					}
@@ -485,7 +556,7 @@ struct PageManager::Impl {
 		}
 	}
 
-	template <bool track, bool is_read>
+	template <bool track, bool is_read, bool offload = false, bool reapply = false>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		const auto begin = PageStart(vaddr);
 		const auto end   = PageEnd(vaddr, size);
@@ -498,7 +569,8 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false, offload, reapply>(*region, region_base,
+			                                                              first, last);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -556,10 +628,22 @@ bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
 		return false;
 	}
 	SpinGuard lock(region->lock);
-	if (region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE].Perms() != READ_WRITE_PROTECTION) {
+	if (Impl::PermsOf(*region, (vaddr % REGION_SIZE) / PAGE_SIZE) != READ_WRITE_PROTECTION) {
 		return false;
 	}
 	return Libs::LibKernel::Memory::RestoreGuestWritable(PageStart(vaddr), PAGE_SIZE);
+}
+
+void PageManager::SettleProtection(uint64_t vaddr) noexcept {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		(void)Libs::LibKernel::Memory::RestoreGuestProtection(PageStart(vaddr), PAGE_SIZE);
+		return;
+	}
+	SpinGuard  lock(region->lock);
+	const auto perms = Impl::PermsOf(*region, (vaddr % REGION_SIZE) / PAGE_SIZE);
+	if (perms == READ_WRITE_PROTECTION) (void)Libs::LibKernel::Memory::RestoreGuestProtection(PageStart(vaddr), PAGE_SIZE);
+	else Impl::ProtectHost(PageStart(vaddr), PAGE_SIZE, perms);
 }
 
 bool PageManager::WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
@@ -571,8 +655,7 @@ bool PageManager::WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, ui
 		if (auto* region = m_impl->FindRegion(at); region != nullptr) {
 			SpinGuard lock(region->lock);
 			for (uint64_t page = at; page < until; page += PAGE_SIZE) {
-				const auto& state = region->pages[(page % REGION_SIZE) / PAGE_SIZE];
-				if (state.write_watchers == 0 && state.access_watchers == 0) continue;
+				if (Impl::PermsOf(*region, (page % REGION_SIZE) / PAGE_SIZE) == READ_WRITE_PROTECTION) continue;
 				if (!any) *first = page;
 				any  = true;
 				*end = page + PAGE_SIZE;
@@ -603,6 +686,15 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
+template <bool track, bool reapply>
+void PageManager::UpdateReadWatchers(uint64_t vaddr, uint64_t size) {
+	m_impl->UpdatePageWatchers<track, false, true, reapply>(vaddr, size);
+}
+
+template void PageManager::UpdateReadWatchers<true>(uint64_t, uint64_t);
+template void PageManager::UpdateReadWatchers<false>(uint64_t, uint64_t);
+template void PageManager::UpdateReadWatchers<false, true>(uint64_t, uint64_t);
+
 void PageManager::DeferReadProtection(bool on) noexcept {
 	if (!on) {
 		Impl::FlushReadProtect();
@@ -614,6 +706,11 @@ void PageManager::DeferReadProtection(bool on) noexcept {
 void PageManager::FlushDeferredProtection() noexcept {
 	Impl::FlushReadProtect();
 	++g_observation_epoch;
+}
+
+// (No new observation epoch: the guest learns nothing new from protections applied early.)
+void PageManager::FlushDeferredProtection(uint64_t vaddr, uint64_t size) noexcept {
+	Impl::FlushReadProtectOverlapping(vaddr, vaddr + size, false);
 }
 
 uint64_t PageManager::ObservationEpoch() noexcept {

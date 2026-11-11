@@ -14,6 +14,7 @@
 #include "SDL_rwops.h"
 #include "SDL_stdinc.h"
 #include "SDL_surface.h"
+#include "SDL_syswm.h"
 #include "SDL_thread.h"
 #include "SDL_touch.h"
 #include "SDL_video.h"
@@ -33,7 +34,10 @@
 #include "loader/demonsSoulsWarp.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "frame-gen.h"
+#include "local-platform.h"
 #include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -45,10 +49,13 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -119,6 +126,57 @@ static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
 	                                             axis_value);
 }
 
+// The sticks of a pad other than a PlayStation one, whose sticks rest a few percent off centre (more as they wear): a
+// round dead zone of KYTY_PAD_DEADZONE percent of the range (12 by default, 0 none), the rest stretched to the full
+// range, which the stick reaches at KYTY_PAD_DEADZONE_OUTER percent of it (90 by default). On an Xbox pad the character
+// kept walking slowly after a run let go (issue #236); with the dead zone stretched to the edge alone, a stick pushed all
+// the way (a little under its full range at some angles) lost the run more easily. PlayStation pads are passed as they
+// are, to the game's own dead zone as on a PS5; so is the Steam Deck build's pad (Steam Input has one).
+static int PadDeadZonePercent() {
+	static const int percent = [] {
+#if defined(KYTY_STEAM_DECK)
+		const int fallback = 0;
+#else
+		const int fallback = 12;
+#endif
+		const char* value = std::getenv("KYTY_PAD_DEADZONE");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 50) : fallback;
+	}();
+	return percent;
+}
+
+static int PadOuterPercent() {
+	static const int percent = [] {
+		const char* value = std::getenv("KYTY_PAD_DEADZONE_OUTER");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 60, 100) : 90;
+	}();
+	return percent;
+}
+
+// The stick of `axis_id` with the dead zone, both its axes set (PadDeadZonePercent, PadOuterPercent); false: as it is.
+static bool SetStickWithDeadZone(int id, int axis_id) {
+	const int percent = PadDeadZonePercent();
+	if (percent == 0 || ControllerAxisIsTrigger(axis_id)) return false;
+	auto* pad = SDL_GameControllerFromInstanceID(id);
+	if (pad == nullptr) return false;
+	const auto type = SDL_GameControllerGetType(pad);
+	if (type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5) return false;
+	const bool left   = axis_id == SDL_CONTROLLER_AXIS_LEFTX || axis_id == SDL_CONTROLLER_AXIS_LEFTY;
+	const auto axis_x = left ? SDL_CONTROLLER_AXIS_LEFTX : SDL_CONTROLLER_AXIS_RIGHTX;
+	const auto axis_y = left ? SDL_CONTROLLER_AXIS_LEFTY : SDL_CONTROLLER_AXIS_RIGHTY;
+	const double x = SDL_GameControllerGetAxis(pad, axis_x), y = SDL_GameControllerGetAxis(pad, axis_y);
+	const double radius = std::sqrt(x * x + y * y) / SDL_JOYSTICK_AXIS_MAX;
+	const double dead   = percent / 100.0;
+	const double outer  = std::max(dead + 0.05, PadOuterPercent() / 100.0);
+	const double scale  = radius <= dead ? 0.0 : std::min(1.0, (radius - dead) / (outer - dead)) / radius;
+	const auto   value  = [&](double v) {
+        return static_cast<int>(std::clamp(std::lround(v * scale), long {SDL_JOYSTICK_AXIS_MIN}, long {SDL_JOYSTICK_AXIS_MAX}));
+	};
+	Controller::SetAxis(id, ControllerAxisFromSdl(axis_x), ControllerAxisValueFromSdl(axis_x, value(x)));
+	Controller::SetAxis(id, ControllerAxisFromSdl(axis_y), ControllerAxisValueFromSdl(axis_y, value(y)));
+	return true;
+}
+
 struct EventMouse {
 	bool   down;
 	bool   up;
@@ -168,6 +226,8 @@ struct EventController {
 	bool   pressed;
 	bool   released;
 	double timestamp_seconds;
+	// A press: how long its event waited in SDL's queue for this thread, ms (Controller::SetButton's input timing).
+	uint32_t queued_ms;
 };
 
 enum class DisplayOrientation {
@@ -195,6 +255,7 @@ constexpr uint32_t KYTY_SDL_BUTTON_X2MASK = SDL_BUTTON_X2MASK; // NOLINT(hicpp-s
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+std::atomic<uint32_t>          g_output_width {0}, g_output_height {0}; // WindowOutputSize
 
 } // namespace
 
@@ -229,9 +290,15 @@ static void ToggleDesktopFullscreen() {
 	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
 	const auto mode =
 	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	FrameGen::WindowChanging(true);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
+	} else if (g_window->presenter != nullptr) {
+		// (A full screen of the window's own size changes nothing a present reports; FSR's frame generation swapchain
+		// then kept presenting to the window it had: the picture froze, issue #174.)
+		g_window->presenter->RequestSwapchainRecreate();
 	}
+	FrameGen::WindowChanging(false);
 }
 
 static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
@@ -247,7 +314,14 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			// Space pauses and resumes, unless the keymap gives it to the game or the default keys do not count (the Steam
+			// Deck build: Steam's desktop layout sends Space for one of the Deck's buttons, and a press of it left the game
+			// paused, its picture frozen, 10-28); the Pause key always does.
+			case SDLK_SPACE:
+				if (!HostInputMapsKey(SDLK_SPACE) && HostInputDefaultKeysUsed())
+					SetPause(game, !game.paused.load(std::memory_order_acquire));
+				break;
+			case SDLK_PAUSE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			// F8: the emulator's overlay off, the frame rate, detailed, off... (it starts as the launcher's Overlay).
 			case SDLK_F8:
 				if (!key.repeat) {
@@ -335,10 +409,62 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
+// The PS button (an Xbox pad's Guide button) held for two seconds quits, as Close Game on the PS5's home screen (issue
+// #203: pads and Steam Big Picture had no way out): the game has no use for it, and a short press does nothing. With
+// KYTY_PAD_QUIT=backstart (or both) so do Back and Start held together (an Xbox pad's View and Menu, a PlayStation pad's
+// Create and Options), for a pad whose Guide button Steam or Windows' Game Bar takes; not by default, since some pads
+// switch their own mode (XInput, Switch) on that hold. off: neither. A pad that leaves cancels its holds.
+static SDL_TimerID g_quit_hold = 0, g_quit_combo = 0;
+
+static uint32_t QuitAfterHold(uint32_t /*interval*/, void* what) {
+	LOGF("Controller: %s held for 2 s, quitting\n", static_cast<const char*>(what));
+	SDL_Event quit {};
+	quit.type = SDL_QUIT;
+	(void)SDL_PushEvent(&quit);
+	return 0;
+}
+
+static bool PadQuits(bool combo) {
+	static const std::string_view mode = [] {
+		const char* value = std::getenv("KYTY_PAD_QUIT");
+		return std::string_view(value != nullptr ? value : "guide");
+	}();
+	return combo ? mode == "backstart" || mode == "both" : mode != "off" && mode != "backstart";
+}
+
+static void CancelQuitHolds() {
+	for (auto* timer: {&g_quit_hold, &g_quit_combo}) {
+		if (*timer != 0) (void)SDL_RemoveTimer(*timer);
+		*timer = 0;
+	}
+}
+
 static void GameEventController([[maybe_unused]] const EventController& f) {
 	// (A new mapping for a connected controller, e.g. from Steam: its buttons arrive mapped from then on.)
 	if (f.remapped) {
 		return;
+	}
+
+	if (f.removed) CancelQuitHolds();
+	if (f.button == SDL_CONTROLLER_BUTTON_GUIDE && (f.down || f.up) && PadQuits(false)) {
+		if (f.down && g_quit_hold == 0)
+			g_quit_hold = SDL_AddTimer(2000, QuitAfterHold, const_cast<char*>("the PS button"));
+		if (f.up && g_quit_hold != 0) {
+			(void)SDL_RemoveTimer(g_quit_hold);
+			g_quit_hold = 0;
+		}
+	}
+	if ((f.button == SDL_CONTROLLER_BUTTON_BACK || f.button == SDL_CONTROLLER_BUTTON_START) && (f.down || f.up) &&
+	    PadQuits(true)) {
+		auto*      pad  = SDL_GameControllerFromInstanceID(f.id);
+		const bool both = f.down && pad != nullptr && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0 &&
+		                  SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+		if (both && g_quit_combo == 0)
+			g_quit_combo = SDL_AddTimer(2000, QuitAfterHold, const_cast<char*>("Back and Start"));
+		if (f.up && g_quit_combo != 0) {
+			(void)SDL_RemoveTimer(g_quit_combo);
+			g_quit_combo = 0;
+		}
 	}
 
 #ifdef KYTY_DBG_INPUT
@@ -372,15 +498,21 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 
 	if (f.down || f.up) {
-		const auto button = ControllerButtonToPadButton(f.button);
+		auto button = ControllerButtonToPadButton(f.button);
+		// A pad without a touchpad (an Xbox pad's View, others' Back or Select) presses it with that button (issue #197:
+		// otherwise the game's touchpad menu was out of reach); a PlayStation pad's Create button stays the system's.
+		if (f.button == SDL_CONTROLLER_BUTTON_BACK) {
+			const auto type = SDL_GameControllerGetType(SDL_GameControllerFromInstanceID(f.id));
+			if (type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5) button = Controller::PAD_BUTTON_TOUCH_PAD;
+		}
 		if (button != 0) {
-			Controller::SetButton(f.id, button, f.down);
+			Controller::SetButton(f.id, button, f.down, f.queued_ms);
 		}
 	}
 
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
-		if (axis != Controller::Axis::AxisMax) {
+		if (axis != Controller::Axis::AxisMax && !SetStickWithDeadZone(f.id, f.axis_id)) {
 			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
@@ -618,6 +750,9 @@ void WindowContext::ProcessEvent(double time_s) {
 			mb.timestamp_seconds = time_s;
 
 			GameEventMouse(mb);
+			// (Notches away from the user count as up whatever the system's scroll direction.)
+			if (event->wheel.which != SDL_TOUCH_MOUSEID)
+				HostInputMouseWheel(event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event->wheel.y : event->wheel.y);
 
 			break;
 		}
@@ -710,6 +845,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			c.pressed           = (event->cbutton.state == SDL_PRESSED);
 			c.released          = (event->cbutton.state == SDL_RELEASED);
 			c.timestamp_seconds = time_s;
+			c.queued_ms         = c.down ? SDL_GetTicks() - event->cbutton.timestamp : 0;
 
 			GameEventController(c);
 
@@ -776,6 +912,21 @@ void WindowContext::RunOnMainThread(std::function<void()> task) {
 	}
 }
 
+void WindowContext::PostToMainThread(std::function<void()> task) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		++main_tasks_queued;
+	}
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+}
+
 void WindowContext::DrainMainThreadTasks() {
 	std::vector<std::function<void()>> tasks;
 	{
@@ -828,6 +979,11 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+	// Nintendo-layout pads (Switch Pro, Joy-Cons, 8BitDo in Switch mode, GameCube) by position: the bottom button Cross and
+	// the right one Circle, where the game's PlayStation glyphs put them. SDL 2 reported them by label (A, on the right,
+	// was Cross; issue #262). SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1 in the environment keeps the labels (the environment
+	// wins over a hint).
+	SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a
@@ -835,7 +991,8 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
-	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
+	// (The timers: the PS button's hold to quit, QuitAfterHold.)
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
@@ -883,9 +1040,10 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
-	// then becomes that loader (the instance and device are created through it).
+	// then becomes that loader (the instance and device are created through it). Linux: KYTY_UPSCALER=dlss loads
+	// the NGX bridge (libkyty_dlss.so) here, before the instance it adds extensions to.
 	Libs::Graphics::FrameGen::Initialize();
 #endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
@@ -932,9 +1090,27 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	StartupProgressShow(window->window);
 	window->CreateVulkan();
 	StartupProgressHide();
+	// The size the game is shown at: the display's in full screen (the window may not have it yet), else the window's
+	// drawable size (its swapchain's). Demon's Souls' render size follows it (loader/demonsSoulsRenderSize.h).
+	int output_width = 0, output_height = 0;
+	if (Config::FullscreenEnabled()) {
+		SDL_DisplayMode mode {};
+		if (SDL_GetDesktopDisplayMode(std::max(SDL_GetWindowDisplayIndex(window->window), 0), &mode) == 0) {
+			output_width  = mode.w;
+			output_height = mode.h;
+		}
+	}
+	if (output_width <= 0 || output_height <= 0) SDL_Vulkan_GetDrawableSize(window->window, &output_width, &output_height);
+	g_output_width.store(static_cast<uint32_t>(std::max(output_width, 0)), std::memory_order_relaxed);
+	g_output_height.store(static_cast<uint32_t>(std::max(output_height, 0)), std::memory_order_relaxed);
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
 	return presenter;
+}
+
+void WindowOutputSize(uint32_t* width, uint32_t* height) {
+	*width  = g_output_width.load(std::memory_order_relaxed);
+	*height = g_output_height.load(std::memory_order_relaxed);
 }
 
 void WindowRun() {
@@ -942,6 +1118,14 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The focus back to the window that had it before the game (KYTY_RETURN_FOCUS), before the caches are saved.
+	if (SDL_SysWMinfo info {}; g_window->window != nullptr) {
+		SDL_VERSION(&info.version);
+		if (SDL_GetWindowWMInfo(g_window->window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS)
+			LocalPlatform::ReturnFocus(info.info.win.window);
+	}
+#endif
 	g_window->render_context->GetPipelineCache().StopWarmup();
 	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
@@ -1030,7 +1214,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(uint32_t presented, const char* generator) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -1043,7 +1227,9 @@ void WindowContext::UpdateTitle() {
 	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
 	static uint64_t frame_num   = 0;
 	static uint64_t fps_frames  = 0;
+	static uint64_t fps_shown   = 0; // images shown, generated ones included
 	static double   current_fps = 0.0;
+	static double   shown_fps   = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1057,24 +1243,41 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	fps_shown += presented;
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
+		shown_fps   = static_cast<double>(fps_shown) * static_cast<double>(frequency) / static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+		fps_shown   = 0;
 	}
 
+	// Twice a second at most, and never waiting for the main thread (PostToMainThread): the title is set while the
+	// present thread goes on.
+	static uint64_t title_at = 0;
+	if (now - title_at < frequency / 2 || title_posted.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	title_at = now;
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// (The game's frame rate first, the rate shown with the generated frames after it.)
+	if (generator != nullptr && shown_fps > current_fps + 0.5) {
+		text += fmt::format(" ({}: {:.0f})", generator, shown_fps);
+	}
 	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
 		text += fmt::format(", waypoints: {}", waypoints);
 	}
 
-	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+	PostToMainThread([this, text = std::move(text)] {
+		SDL_SetWindowTitle(window, text.c_str());
+		title_posted.store(false, std::memory_order_release);
+	});
 }
 
 } // namespace Libs::Graphics

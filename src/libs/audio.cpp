@@ -10,6 +10,7 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
+#include "libs/controller.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -17,10 +18,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include "libatrac9.h"
@@ -44,6 +50,94 @@ static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
 	       type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_AUDIO3D ||
 	       type == AUDIO_OUT_PORT_TYPE_AUX;
+}
+
+template <typename T>
+float StretchSample(T value) {
+	if constexpr (std::is_same_v<T, float>) {
+		return value;
+	} else {
+		return static_cast<float>(value) / 32768.0f;
+	}
+}
+
+template <typename T>
+T StretchSampleBack(float value) {
+	if constexpr (std::is_same_v<T, float>) {
+		return value;
+	} else {
+		return static_cast<T>(std::clamp(std::lround(value * 32768.0f), -32768L, 32767L));
+	}
+}
+
+// (QueueSdlAudio.) `grain` (device frames of T, `channels` interleaved) followed by one more stretch of the sound into
+// `out`: the lag of 2.5-15 ms at which the sound before the grain's end matches that end best (`history` holds the
+// frames queued before the grain), the grain's last 3 ms cross-fading into the sound one lag earlier, which then plays
+// on to the grain's end once more. The next grain follows on as it would have; the added frames (the lag) are returned,
+// 0 with too little history.
+template <typename T>
+uint32_t StretchGrain(const std::vector<uint8_t>& history, const void* grain_data, uint32_t grain_bytes,
+                      uint32_t channels, uint32_t freq, std::vector<uint8_t>* out) {
+	const uint32_t frame    = channels * static_cast<uint32_t>(sizeof(T));
+	const uint32_t h        = static_cast<uint32_t>(history.size()) / frame;
+	const uint32_t n        = grain_bytes / frame;
+	const uint32_t total    = h + n;
+	const uint32_t window   = std::min(n, freq / 200);
+	const uint32_t fade     = std::min(n, freq * 3 / 1000);
+	const uint32_t shortest = freq / 400;
+	const uint32_t longest  = std::min(freq * 15 / 1000, total > window ? total - window : 0u);
+	if (channels == 0 || window == 0 || fade == 0 || shortest == 0 || longest < shortest) {
+		return 0;
+	}
+	const auto* past  = reinterpret_cast<const T*>(history.data());
+	const auto* grain = static_cast<const T*>(grain_data);
+	const auto  at    = [&](uint32_t i, uint32_t c) {
+		return i < h ? past[i * channels + c] : grain[(i - h) * channels + c];
+	};
+	thread_local std::vector<float> mono;
+	mono.assign(total, 0.0f);
+	for (uint32_t i = 0; i < total; i++) {
+		for (uint32_t c = 0; c < channels; c++) {
+			mono[i] += StretchSample<T>(at(i, c));
+		}
+	}
+	const float* end        = mono.data() + total - window;
+	float        end_energy = 0.0f;
+	for (uint32_t k = 0; k < window; k++) {
+		end_energy += end[k] * end[k];
+	}
+	uint32_t lag  = shortest;
+	float    best = -2.0f;
+	for (uint32_t p = shortest; p <= longest; p++) {
+		const float* earlier = end - p;
+		float        dot = 0.0f, energy = 0.0f;
+		for (uint32_t k = 0; k < window; k++) {
+			dot += end[k] * earlier[k];
+			energy += earlier[k] * earlier[k];
+		}
+		const float score = dot / std::sqrt(energy * end_energy + 1e-20f);
+		if (score > best) {
+			best = score;
+			lag  = p;
+		}
+	}
+	out->resize(static_cast<size_t>(n + lag) * frame);
+	auto* o = reinterpret_cast<T*>(out->data());
+	std::memcpy(o, grain, static_cast<size_t>(n - fade) * frame);
+	for (uint32_t j = n - fade; j < n; j++) {
+		const float x = (static_cast<float>(j - (n - fade)) + 0.5f) / static_cast<float>(fade);
+		const float w = 0.5f - 0.5f * std::cos(3.14159265f * x);
+		for (uint32_t c = 0; c < channels; c++) {
+			const float mixed = (1.0f - w) * StretchSample<T>(at(h + j, c)) + w * StretchSample<T>(at(h + j - lag, c));
+			o[j * channels + c] = StretchSampleBack<T>(mixed);
+		}
+	}
+	for (uint32_t j = n; j < n + lag; j++) {
+		for (uint32_t c = 0; c < channels; c++) {
+			o[j * channels + c] = at(h + j - lag, c);
+		}
+	}
+	return lag;
 }
 
 } // namespace
@@ -114,6 +208,12 @@ private:
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
+
+		// The device queue's reserve (QueueSdlAudio): its size now, and since when no dropout changed it.
+		uint64_t reserve_us = 0;
+		uint64_t calm_since = 0;
+		// The last 20 ms of the game's sound queued (device format; for the stretches, QueueSdlAudio).
+		std::vector<uint8_t> recent;
 	};
 
 	struct PortIn {
@@ -141,6 +241,7 @@ private:
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, const float* gains, bool blocking);
+	static bool            GrainQuiet(const void* data, uint32_t bytes, SDL_AudioFormat format);
 };
 
 static Audio* g_audio = nullptr;
@@ -186,6 +287,29 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 
 	return g_audio->AudioOutOutputs(output_params.data(),
 	                                static_cast<uint32_t>(output_params.size()), blocking);
+}
+
+MainOutput MainOutputReported() {
+	static const MainOutput output = [] {
+		MainOutput  reported;
+		const char* value = std::getenv("KYTY_AUDIO_OUTPUT");
+		std::string name  = value != nullptr ? value : "";
+		std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (name == "headphones") {
+			reported.connection = 0x40;
+		} else if (name == "amplifier") {
+			reported.speaker_type = 1;
+		} else if (name == "soundbar") {
+			reported.speaker_type = 2;
+		} else if (!name.empty() && name != "tv") {
+			std::printf("AudioOut: KYTY_AUDIO_OUTPUT=%s is none of tv, headphones, amplifier, soundbar: the game is told a TV\n",
+			            value);
+			return reported;
+		}
+		if (!name.empty()) std::printf("AudioOut: the game is told its sound goes to %s (KYTY_AUDIO_OUTPUT)\n", name.c_str());
+		return reported;
+	}();
+	return output;
 }
 
 } // namespace AudioInternal
@@ -241,7 +365,7 @@ SDL_AudioFormat Audio::SdlFormat(Format format) {
 // refused: playing the game's audio on the wrong device is worse than not playing it (the
 // mainline's DualSenseHaptics refuses ambiguous USB or Bluetooth endpoints for the same reason).
 // Diagnostic for now: it only says which device would be used (see the AUDIO-DEVICE lines).
-static std::string FindControllerAudioDevice() {
+std::string FindControllerAudioDevice() {
 	if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
 		return {};
 	}
@@ -294,11 +418,25 @@ static void LogAudioDevicesOnce() {
 	}
 }
 
+bool EnsureSdlAudio() {
+#if defined(KYTY_STEAM_DECK)
+	// The Steam Deck build: SDL's ALSA backend (PipeWire's ALSA plugin plays it), PulseAudio's if ALSA fails, unless
+	// SDL_AUDIODRIVER names others. Each of the game's 8 ports is a device of its own, waking every 5.3 ms grain: through
+	// PulseAudio that took ~0.47 of a CPU (its main loop 0.37, nearly all in the kernel), through ALSA ~0.11; standing at
+	// 1-1, 36.6-36.85 fps (three boots) -> 37.8-37.9 (two), the same queue dropouts.
+	if (std::getenv("SDL_AUDIODRIVER") == nullptr) setenv("SDL_AUDIODRIVER", "alsa,pulseaudio", 0);
+#endif
+	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
+		return false;
+	}
+	return true;
+}
+
 bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
-	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
+	if (!EnsureSdlAudio()) {
 		return false;
 	}
 
@@ -456,6 +594,34 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
+// Whether a grain, in the device's format, is near silence (every sample below -60 dBFS): where leaving one out, or
+// adding one of silence, cannot be heard. Formats other than 16-bit and 32-bit float samples count as not quiet.
+bool Audio::GrainQuiet(const void* data, uint32_t bytes, SDL_AudioFormat format) {
+	if (data == nullptr || bytes == 0) {
+		return false;
+	}
+	if (SDL_AUDIO_ISFLOAT(format) && SDL_AUDIO_BITSIZE(format) == 32 && !SDL_AUDIO_ISBIGENDIAN(format)) {
+		const auto* samples = static_cast<const float*>(data);
+		for (uint32_t i = 0; i < bytes / 4; i++) {
+			if (samples[i] > 0.001f || samples[i] < -0.001f) {
+				return false;
+			}
+		}
+		return true;
+	}
+	if (!SDL_AUDIO_ISFLOAT(format) && SDL_AUDIO_BITSIZE(format) == 16 && SDL_AUDIO_ISSIGNED(format) &&
+	    !SDL_AUDIO_ISBIGENDIAN(format)) {
+		const auto* samples = static_cast<const int16_t*>(data);
+		for (uint32_t i = 0; i < bytes / 2; i++) {
+			if (samples[i] > 32 || samples[i] < -32) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, bool blocking) {
 	EXIT_IF(port == nullptr);
 
@@ -508,9 +674,18 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 			report_pad_samples(false);
 			std::vector<uint8_t> prepared_buffer;
 			const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
-			return Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq,
-			                                           PreparedChannels(*port),
+			// (A write the open route refuses is a block it had no room for: dropped, not rumbled. The motors below would
+			// drive a USB DualSense's too on Windows, whose WASAPI route drops a block when its buffer is behind. A
+			// stereo-profile pad or a route not open yet is not Available: the motors below take it.)
+			return Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq, PreparedChannels(*port),
 			                                           FormatIsFloat(port->format), false, gains);
+		}
+		// No DualSense haptics endpoint: the pad's rumble motors instead (an Xbox controller, a Steam Deck's; issue #236).
+		if (port->type == AUDIO_OUT_PORT_TYPE_VIBRATION) {
+			std::vector<uint8_t> prepared_buffer;
+			const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
+			Controller::RumbleFromVibrationAudio(prepared_data, port->samples_num, PreparedChannels(*port),
+			                                     FormatIsFloat(port->format), gains);
 		}
 		return false;
 	}
@@ -568,17 +743,158 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		queue_size = static_cast<uint32_t>(cvt.len_cvt);
 	}
 
+	const auto now       = LibKernel::KernelGetProcessTime();
+	const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+	// The device queue's reserve (KYTY_AUDIO_BUFFER_MS, default 20; 0: none, as before). The game hands its sound over a
+	// grain at a time and at most its context's few grains ahead (Demon's Souls: 4 of 5.3 ms, without waiting), so a
+	// stall of its audio thread longer than that played silence: crackles on busy PCs (issue #85). The first grain, and a
+	// grain that finds the queue run dry, go in behind that much silence. Each dropout under 300 ms adds 20 ms to the
+	// port's reserve (200 ms at most); a minute without one takes 10 ms off again, not below the default. The queue is
+	// kept near it where nobody hears it: above the reserve, the game's 4 grains and 10 ms more, a near-silent grain is
+	// left out (any grain 90 ms beyond that); below half the reserve, a silent grain goes in before a near-silent one. So
+	// the clocks of the CPU and the sound device, some millionths apart, do not make the latency grow over a session.
+	// Below half the reserve with sound, the grain is stretched instead (StretchGrain, 2.5-15 ms more of it): a game
+	// whose audio thread comes late again and again makes less sound than the device plays (issue #85: at an RTX 2060
+	// PC's CPU limit the game missed 9% of the time), and the reserve alone made each gap longer (up to 200 ms of
+	// silence, the sound cutting in and out). KYTY_AUDIO_STRETCH=0 turns that off.
+	// KYTY_AUDIO_LOG reports dropouts, the reserve, grains left out, added or stretched and a main port's queue level.
+	static const uint64_t base_reserve_us = [] {
+		const char* value = std::getenv("KYTY_AUDIO_BUFFER_MS");
+		return static_cast<uint64_t>(value != nullptr ? std::clamp(std::atoi(value), 0, 200) : 20) * 1000u;
+	}();
+	static const bool stretch = [] {
+		const char* value = std::getenv("KYTY_AUDIO_STRETCH");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	static const bool            log_queue = std::getenv("KYTY_AUDIO_LOG") != nullptr;
+	static std::atomic<uint32_t> empties {0}, clears {0}, trims {0}, fills {0}, stretches {0};
+	static std::atomic<uint64_t> stretched_us {0};
+	std::vector<uint8_t>         stretched;
+	const uint32_t               queued_bytes =
+	    log_queue || base_reserve_us != 0 ? SDL_GetQueuedAudioSize(port->audio_device) : 1u;
+	// (KYTY_AUDIO_LOG.) A main port's queue level before each output (ms), its lowest and highest every 2 s.
+	if (log_queue && port->type == 0 && queue_size != 0 && buffer_us != 0 && port->audio_device < 64) {
+		struct Level {
+			uint64_t since = 0;
+			double   low = 1e9, high = 0;
+		};
+		static Level levels[64];
+		auto&        level = levels[port->audio_device];
+		const double ms    = static_cast<double>(queued_bytes) * static_cast<double>(buffer_us) / 1000.0 / queue_size;
+		level.low          = std::min(level.low, ms);
+		level.high         = std::max(level.high, ms);
+		if (level.since == 0) level.since = now;
+		if (now - level.since >= 2000000) {
+			std::printf("AudioOut: at %.1f s main port (device %u) queue %.1f-%.1f ms over 2 s\n",
+			            static_cast<double>(now) / 1e6, static_cast<unsigned>(port->audio_device), level.low, level.high);
+			level = Level {now};
+		}
+	}
+	if (port->last_output_time != 0 && queued_bytes == 0) {
+		const auto count = empties.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (log_queue && (count <= 40 || count % 100 == 0)) {
+			std::printf("AudioOut: port type %d queue ran empty (#%u), %.1f ms since its last output\n", port->type, count,
+			            static_cast<double>(now - port->last_output_time) / 1000.0);
+		}
+	}
+	if (base_reserve_us != 0 && buffer_us != 0 && queue_size != 0) {
+		const bool first   = port->last_output_time == 0;
+		const bool ran_dry = !first && queued_bytes == 0;
+		if (port->reserve_us == 0) {
+			port->reserve_us = base_reserve_us;
+			port->calm_since = now;
+		}
+		// (A grain after a longer pause, a menu or a load, starts again behind the reserve without growing it.)
+		if (ran_dry && now - port->last_output_time < 300000) {
+			port->reserve_us = std::min<uint64_t>(port->reserve_us + 20000, 200000);
+			port->calm_since = now;
+		} else if (now - port->calm_since >= 60000000 && port->reserve_us > base_reserve_us) {
+			port->reserve_us = std::max<uint64_t>(base_reserve_us, port->reserve_us - 10000);
+			port->calm_since = now;
+		}
+		if (first || ran_dry) {
+			const auto           grains = (port->reserve_us + buffer_us - 1) / buffer_us;
+			std::vector<uint8_t> silence(static_cast<size_t>(queue_size * grains), port->audio_spec.silence);
+			(void)SDL_QueueAudio(port->audio_device, silence.data(), static_cast<uint32_t>(silence.size()));
+			if (log_queue && ran_dry && port->type == 0 && now - port->last_output_time < 300000) {
+				std::printf("AudioOut: port type %d (device %u) reserve %.0f ms after a dropout%s\n", port->type,
+				            static_cast<unsigned>(port->audio_device), static_cast<double>(port->reserve_us) / 1000.0,
+				            GrainQuiet(queue_data, queue_size, port->audio_spec.format) ? " (near-silent)" : "");
+			}
+		} else {
+			const auto queued_us = static_cast<uint64_t>(queued_bytes) * buffer_us / queue_size;
+			const auto high_us   = port->reserve_us + 4 * buffer_us + 10000;
+			const bool quiet     = GrainQuiet(queue_data, queue_size, port->audio_spec.format);
+			if ((queued_us > high_us && quiet) || queued_us > high_us + 90000) {
+				const auto count = trims.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (log_queue && (count <= 40 || count % 100 == 0)) {
+					std::printf("AudioOut: port type %d grain left out (#%u): %.1f ms queued%s\n", port->type, count,
+					            static_cast<double>(queued_us) / 1000.0, quiet ? " (near-silent)" : "");
+				}
+				return true;
+			}
+			if (queued_us * 2 < port->reserve_us && quiet) {
+				std::vector<uint8_t> silence(queue_size, port->audio_spec.silence);
+				(void)SDL_QueueAudio(port->audio_device, silence.data(), queue_size);
+				const auto count = fills.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (log_queue && (count <= 40 || count % 100 == 0)) {
+					std::printf("AudioOut: port type %d silent grain added (#%u): %.1f ms queued\n", port->type, count,
+					            static_cast<double>(queued_us) / 1000.0);
+				}
+			} else if (queued_us * 2 < port->reserve_us && stretch && port->audio_spec.freq > 0) {
+				const auto     format   = port->audio_spec.format;
+				const uint32_t channels = port->audio_spec.channels;
+				const auto     freq     = static_cast<uint32_t>(port->audio_spec.freq);
+				const bool     little   = !SDL_AUDIO_ISBIGENDIAN(format);
+				uint32_t       added    = 0;
+				if (SDL_AUDIO_ISFLOAT(format) && SDL_AUDIO_BITSIZE(format) == 32 && little) {
+					added = StretchGrain<float>(port->recent, queue_data, queue_size, channels, freq, &stretched);
+				} else if (SDL_AUDIO_ISSIGNED(format) && SDL_AUDIO_BITSIZE(format) == 16 && little) {
+					added = StretchGrain<int16_t>(port->recent, queue_data, queue_size, channels, freq, &stretched);
+				}
+				if (added != 0) {
+					const uint64_t added_us = uint64_t {added} * 1000000u / freq;
+					const auto     count    = stretches.fetch_add(1, std::memory_order_relaxed) + 1;
+					const auto     total    = stretched_us.fetch_add(added_us, std::memory_order_relaxed) + added_us;
+					if (log_queue && (count <= 40 || count % 100 == 0)) {
+						std::printf("AudioOut: port type %d (device %u) grain stretched by %.1f ms "
+						            "(#%u, %.0f ms in all): %.1f ms queued\n",
+						            port->type, static_cast<unsigned>(port->audio_device),
+						            static_cast<double>(added_us) / 1000.0, count, static_cast<double>(total) / 1000.0,
+						            static_cast<double>(queued_us) / 1000.0);
+					}
+				}
+			}
+		}
+		// (The sound before the next grain, for its stretch: none across a gap.)
+		if (first || ran_dry) port->recent.clear();
+		const size_t keep = static_cast<size_t>(port->audio_spec.freq / 50) * port->audio_spec.channels *
+		                    SDL_AUDIO_BITSIZE(port->audio_spec.format) / 8;
+		const auto* bytes = static_cast<const uint8_t*>(queue_data);
+		port->recent.insert(port->recent.end(), bytes, bytes + queue_size);
+		if (port->recent.size() > keep) {
+			port->recent.erase(port->recent.begin(), port->recent.end() - static_cast<std::ptrdiff_t>(keep));
+		}
+	}
+	if (!stretched.empty()) {
+		queue_data = stretched.data();
+		queue_size = static_cast<uint32_t>(stretched.size());
+	}
+
 	if (blocking) {
 		constexpr uint64_t target_latency_us = 40000;
-		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
 		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
-		const auto wait_start      = LibKernel::KernelGetProcessTime();
+		const auto wait_start      = now;
 		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearQueuedAudio(port->audio_device);
+				if (log_queue) {
+					std::printf("AudioOut: port type %d queue cleared after 200 ms without draining (#%u)\n", port->type,
+					            clears.fetch_add(1, std::memory_order_relaxed) + 1);
+				}
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
@@ -608,6 +924,8 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			port.freq             = freq;
 			port.format           = format;
 			port.last_output_time = 0;
+			port.reserve_us       = 0;
+			port.calm_since       = 0;
 
 			switch (format) {
 				case Format::Signed16bitMono:
@@ -936,7 +1254,7 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 		case AUDIO_OUT_PORT_TYPE_MAIN:
 		case AUDIO_OUT_PORT_TYPE_BGM:
 		case AUDIO_OUT_PORT_TYPE_AUDIO3D:
-			state->output  = 1;
+			state->output  = AudioInternal::MainOutputReported().connection;
 			state->channel = (channels_num > 2 ? 2 : channels_num);
 			break;
 		case AUDIO_OUT_PORT_TYPE_VOICE:
